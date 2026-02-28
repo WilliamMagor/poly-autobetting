@@ -31,34 +31,6 @@ logging.basicConfig(
 log = logging.getLogger("place45")
 
 
-class RateLimiter:
-    """Simple rate limiter for API calls."""
-
-    def __init__(self, max_calls: int, period: float):
-        self.max_calls = max_calls
-        self.period = period
-        self._calls: list[float] = []
-
-    async def acquire(self):
-        """Wait if necessary to respect rate limits."""
-        now = time.time()
-        # Remove calls outside the window
-        self._calls = [t for t in self._calls if now - t < self.period]
-
-        if len(self._calls) >= self.max_calls:
-            # Wait until oldest call expires
-            wait_time = self.period - (now - self._calls[0]) + 0.1
-            if wait_time > 0:
-                log.debug("Rate limiting: waiting %.2fs", wait_time)
-                await asyncio.sleep(wait_time)
-                self._calls = [t for t in self._calls if time.time() - t < self.period]
-
-        self._calls.append(time.time())
-
-
-# Rate limiter: 10 calls per second max (conservative for Polymarket API)
-_ratelimiter = RateLimiter(max_calls=10, period=1.0)
-
 # --- Config ---
 PRICE = 0.45
 SHARES_PER_SIDE = 10     # Reduced for 5min markets (more frequent rotations)
@@ -117,9 +89,6 @@ async def get_market_info(slug: str) -> dict:
     import re
     if not re.match(r"^btc-updown-5m-\d+$", slug):
         raise ValueError(f"Invalid slug format: expected btc-updown-5m-<timestamp>, got {slug}")
-
-    # Rate limit API calls
-    await _ratelimiter.acquire()
 
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{GAMMA_URL}/events", params={"slug": slug})

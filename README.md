@@ -1,13 +1,13 @@
 # poly-autobetting
 
-Automated trading bot for Polymarket BTC 15-minute prediction markets. Places 45c limit orders on both UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions via gasless relayer.
+Automated trading bot for Polymarket BTC 5-minute prediction markets. Places 45c limit orders on both UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions via gasless relayer.
 
 ## How It Works
 
-The bot targets BTC 15-minute up/down binary markets on Polymarket. It places 45c buy limit orders on both sides (UP and DOWN) for each market. When both sides fill, the combined cost is $0.90 for a guaranteed $1.00 payout — netting $0.10 profit per round. It automatically rotates to new markets every 15 minutes.
+The bot targets BTC 5-minute up/down binary markets on Polymarket. It places 45c buy limit orders on both sides (UP and DOWN) for each market. When both sides fill, the combined cost is $0.90 for a guaranteed $1.00 payout — netting $0.10 profit per round. It automatically rotates to new markets every 5 minutes.
 
 - **Dual-Side 45c Orders** — places limit buys on both UP and DOWN at 45c each
-- **Auto-Rotation** — detects and places orders on upcoming 15-minute markets
+- **Auto-Rotation** — detects and places orders on upcoming 5-minute markets
 - **WebSocket Price Feed** — real-time order book monitoring with auto-reconnect
 - **Auto-Redeem** — redeems resolved positions via Polymarket's gasless builder relayer
 
