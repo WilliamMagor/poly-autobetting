@@ -461,14 +461,6 @@ async def run():
     client = init_clob_client()
     relayer = init_relayer()
     
-    # Ensure allowances are set for trading and redeeming
-    log.info("Setting up allowances...")
-    try:
-        client.ensure_allowances()
-        log.info("Allowances set successfully.")
-    except Exception as e:
-        log.warning("Allowance setup warning: %s", e)
-    
     log.info("SDK ready. Placing 45c orders on BTC 5m markets.")
     if relayer:
         log.info("Auto-redeem enabled (gasless relayer).\n")
