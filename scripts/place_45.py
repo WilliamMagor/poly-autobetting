@@ -30,6 +30,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("place45")
 
+# --- Structured trade log (JSONL) ---
+# One JSON object per decision event, written to logs/place_45_YYYYMMDD.jsonl.
+# Designed for Claude Code to analyze and surface algo improvements.
+_trade_log = None  # file handle, opened in run()
+
+def open_trade_log():
+    """Open (or create) today's JSONL trade log. Called once at startup."""
+    global _trade_log
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    date_str = time.strftime("%Y%m%d")
+    path = os.path.join(log_dir, f"place_45_{date_str}.jsonl")
+    _trade_log = open(path, "a", buffering=1)  # line-buffered
+    log.info("Trade log: %s", path)
+
+def log_trade(event: str, **fields):
+    """Append one structured event to today's JSONL trade log."""
+    if _trade_log is None:
+        return
+    record = {"ts": int(time.time()), "event": event, **fields}
+    _trade_log.write(json.dumps(record) + "\n")
+
 
 # --- Config ---
 PRICE = 0.45
@@ -374,6 +396,10 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
             info["hedge_side"] = hedge_side
             info["filled_bal"] = filled_bal
             info["trailing_min_ask"] = None
+            log_trade("fill_detected", market_ts=ts,
+                      filled_side="UP" if hedge_side == "dn" else "DN",
+                      filled_bal=filled_bal, hedge_side=hedge_side.upper(),
+                      elapsed_s=time_elapsed)
 
         hedge_side: str = info["hedge_side"]
         hedge_token = up_token if hedge_side == "up" else dn_token
@@ -414,6 +440,8 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                     filled_ask, HEDGE_FORCE_BUY_FILLED_THRESHOLD,
                     hedge_side.upper(), hedge_ask,
                 )
+                log_trade("hedge_force_buy", market_ts=ts, hedge_side=hedge_side.upper(),
+                          filled_ask=filled_ask, hedge_ask=hedge_ask, elapsed_s=time_elapsed)
                 buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
                 info["hedge_done"] = True
                 continue
@@ -444,6 +472,9 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                     hedge_side.upper(), hedge_ask, band, time_elapsed,
                     filled_label, filled_bal,
                 )
+                log_trade("hedge_sell_filled", market_ts=ts, hedge_side=hedge_side.upper(),
+                          hedge_ask=hedge_ask, band=band, filled_bal=filled_bal,
+                          elapsed_s=time_elapsed)
                 cancel_market_orders(client, {hedge_token})
                 sell_at_bid(client, filled_token, filled_bal, filled_label)
                 info["hedge_done"] = True
@@ -471,11 +502,16 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         )
         triggered = bounce >= min_bounce or valid_bounce
         if triggered:
+            reason = "valid_bounce" if valid_bounce else "trailing"
             log.info(
                 "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f%s)",
                 hedge_side.upper(), trailing_min, hedge_ask, bounce, min_bounce,
                 ", valid-bounce" if valid_bounce else "",
             )
+            log_trade("hedge_trigger", market_ts=ts, hedge_side=hedge_side.upper(),
+                      trail_min=round(trailing_min, 4), ask=round(hedge_ask, 4),
+                      bounce=round(bounce, 4), min_bounce=round(min_bounce, 4),
+                      band=band, reason=reason, elapsed_s=time_elapsed)
             # --- Balance check before buy (prevents double-position) ---
             current_bal = check_token_balance(client, hedge_token)
             if current_bal >= SHARES_PER_SIDE - 0.01:
@@ -483,9 +519,14 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                     "  HEDGE skipped: already hold %.1f %s shares",
                     current_bal, hedge_side.upper(),
                 )
+                log_trade("hedge_balance_skip", market_ts=ts,
+                          hedge_side=hedge_side.upper(), current_bal=current_bal)
                 info["hedge_done"] = True
                 continue
-            buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
+            oid = buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
+            log_trade("hedge_buy", market_ts=ts, side=hedge_side.upper(),
+                      price=round(hedge_ask, 4), shares=SHARES_PER_SIDE,
+                      order_id=oid, elapsed_s=time_elapsed)
             info["hedge_done"] = True
 
 
@@ -606,6 +647,8 @@ def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0
         return False
 
 
+
+
 def check_token_balance(client, token_id: str) -> float:
     """Check CTF token balance via CLOB API (returns shares)."""
     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -679,6 +722,7 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
 
         log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", title[:50], up_bal, dn_bal)
         ok = redeem_market(redeemer, condition_id, neg_risk, up_bal, dn_bal)
+        log_trade("redeem", market_ts=ts, title=title, up_bal=up_bal, dn_bal=dn_bal, ok=ok)
         if ok:
             info["redeemed"] = True
             redeemed.append(ts)
@@ -712,6 +756,7 @@ async def run():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    open_trade_log()
     log.info("Initializing SDK...")
     client = init_clob_client()
     redeemer = init_redeemer()
@@ -850,6 +895,7 @@ async def run():
                     "  Skipping placement — outside %ds window (%ds elapsed since market start)",
                     NEW_MARKET_PLACE_WINDOW_SECONDS, secs_elapsed,
                 )
+                log_trade("window_missed", market_ts=ts, slug=slug, elapsed_s=secs_elapsed)
                 placed_markets.add(ts)
                 past_markets[ts] = {
                     "redeemed": False,
@@ -869,6 +915,10 @@ async def run():
             placed = (1 if up_id else 0) + (1 if dn_id else 0)
             log.info("  Done: %d orders placed. Max cost: $%.2f", placed, SHARES_PER_SIDE * PRICE * 2)
             log.info("")
+            log_trade("orders_placed", market_ts=ts, slug=slug,
+                      title=mkt.get("title", slug), price=PRICE, shares=SHARES_PER_SIDE,
+                      up_id=up_id, dn_id=dn_id, sides_placed=placed,
+                      elapsed_s=now - ts)
 
             placed_markets.add(ts)
             past_markets[ts] = {
