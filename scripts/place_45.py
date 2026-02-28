@@ -795,8 +795,9 @@ async def run():
                 "condition_id": mkt["conditionId"],
                 "neg_risk": mkt.get("neg_risk", False),
                 "title": mkt.get("title", slug),
-                # placed_at unknown for startup-scanned markets; hedge won't activate
-                "placed_at": 0,
+                # Use market start as anchor so hedge windows work correctly
+                # if this market has a one-sided fill when we pick it up.
+                "placed_at": 0 if mkt["closed"] else scan_ts,
             }
             placed_markets.add(scan_ts)
             # Subscribe to WS feed so prices are available for active markets
@@ -856,8 +857,8 @@ async def run():
                     "condition_id": mkt["conditionId"],
                     "neg_risk": mkt.get("neg_risk", False),
                     "title": mkt.get("title", slug),
-                    # placed_at unknown (pre-existing position); hedge won't activate
-                    "placed_at": 0,
+                    # Use ts so hedge activates if this is a one-sided fill
+                    "placed_at": ts,
                 }
                 continue
 
@@ -879,8 +880,8 @@ async def run():
                         "condition_id": mkt["conditionId"],
                         "neg_risk": mkt.get("neg_risk", False),
                         "title": mkt.get("title", slug),
-                        # placed_at unknown (pre-existing orders); hedge won't activate
-                        "placed_at": 0,
+                        # Use ts so hedge activates when one of these orders fills
+                        "placed_at": ts,
                     }
                     continue
             except Exception:
