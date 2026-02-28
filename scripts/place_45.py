@@ -300,22 +300,29 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
       After one limit order fills and the other doesn't, the market has moved
       directionally. Rather than holding a naked directional position to
       resolution, we:
-        1. Cancel the unfilled limit order (it's now above fair value).
-        2. Track the lowest ask of the unfilled side (trail the floor).
-        3. Buy when the price BOUNCES UP by HEDGE_TRAILING_DELTA (confirms floor).
-        4. Apply progressive band thresholds so we only buy if profitable:
+        1. Detect one-sided fill as soon as it happens (no 120s wait) so we
+           start tracking the trailing floor from the moment of fill.
+        2. Wait until 120s before cancelling the unfilled limit (gives it a
+           chance to fill naturally in the first 2 minutes).
+        3. Track the lowest ask of the unfilled side (trail the floor).
+        4. Buy when the price BOUNCES UP by min_bounce (dynamic, starts at
+           HEDGE_TRAILING_DELTA=0.03 and relaxes to ~0.01 at 240s).
+        5. Apply progressive band thresholds so we only buy if profitable:
              120-180s: hedge_ask < HEDGE_BAND_2MIN (0.45)  →  total < 0.90
              180-240s: hedge_ask < HEDGE_BAND_3MIN (0.55)  →  total < 1.00
-        5. At 240s+: force-buy if the FILLED side's ask >= 0.85 (the market is
-           very confident, so the unfilled side is now very cheap ~0.15).
+        6. If hedge_ask >= band after 180s, sell the filled side instead of
+           waiting — hedging would cost more than $1.00, so exit gracefully.
+        7. At 240s+: force-buy if the FILLED side's ask >= 0.85 (the market
+           is very confident, unfilled side is cheap ~0.15).
 
     Timing anchor: placed_at == ts (market START timestamp), so time_elapsed
     mirrors the Rust bot's (MARKET_PERIOD - time_remaining_seconds) exactly.
 
     State stored per market in past_markets:
       hedge_side:        "up" | "dn" | None  — which side needs to be hedged
+      filled_bal:        float — balance of the filled side at detection time
       hedge_cancelled:   bool — unfilled limit was cancelled
-      hedge_done:        bool — hedge buy was placed
+      hedge_done:        bool — hedge buy was placed or filled side sold
       trailing_min_ask:  float | None — lowest ask seen for unfilled side
     """
     now = int(time.time())
@@ -333,11 +340,7 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
 
         time_elapsed = now - placed_at
 
-        # Don't start hedge logic until 2 minutes into the market
-        if time_elapsed < HEDGE_START_AFTER_S:
-            continue
-
-        # --- Step 1: Detect one-sided fill (once, then cache result) ---
+        # --- Step 1: Detect one-sided fill (no time gate — start tracking early) ---
         if not info.get("hedge_side"):
             try:
                 up_bal = check_token_balance(client, up_token)
@@ -346,38 +349,33 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                 continue
 
             if up_bal > 0 and dn_bal == 0:
-                hedge_side = "dn"
+                hedge_side, filled_bal = "dn", up_bal
             elif dn_bal > 0 and up_bal == 0:
-                hedge_side = "up"
+                hedge_side, filled_bal = "up", dn_bal
             else:
-                # Both filled (complete set) or neither filled — nothing to do
+                # Both filled (complete set) or neither filled — nothing to do yet
                 continue
 
             log.info(
-                "  HEDGE detected one-sided fill at %ds: %s filled, need to hedge %s",
+                "  HEDGE detected one-sided fill at %ds: %s filled, tracking %s",
                 time_elapsed,
                 "UP" if hedge_side == "dn" else "DN",
                 hedge_side.upper(),
             )
             info["hedge_side"] = hedge_side
+            info["filled_bal"] = filled_bal
             info["trailing_min_ask"] = None
 
         hedge_side: str = info["hedge_side"]
         hedge_token = up_token if hedge_side == "up" else dn_token
         filled_token = dn_token if hedge_side == "up" else up_token
+        filled_label = "UP" if hedge_side == "dn" else "DN"
 
-        # --- Step 2: Cancel unfilled limit (once) ---
-        if not info.get("hedge_cancelled"):
-            log.info("  HEDGE cancelling unfilled %s limit", hedge_side.upper())
-            cancel_market_orders(client, {hedge_token})
-            info["hedge_cancelled"] = True
-
-        # --- Step 3: Get current ask for the hedge side from WS ---
+        # --- Step 2: Track trailing minimum from fill detection (before 120s) ---
         hedge_ask = ws_feed.get_best_ask(hedge_token)
         if hedge_ask is None:
             continue
 
-        # Update trailing minimum
         prev_min = info.get("trailing_min_ask")
         if prev_min is None or hedge_ask < prev_min:
             info["trailing_min_ask"] = hedge_ask
@@ -386,11 +384,20 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
 
         trailing_min = info["trailing_min_ask"]
 
+        # Don't cancel or buy until 120s — give unfilled limit a chance to fill
+        if time_elapsed < HEDGE_START_AFTER_S:
+            continue
+
+        # --- Step 3: Cancel unfilled limit once at 120s ---
+        if not info.get("hedge_cancelled"):
+            log.info("  HEDGE cancelling unfilled %s limit", hedge_side.upper())
+            cancel_market_orders(client, {hedge_token})
+            info["hedge_cancelled"] = True
+
         # --- Step 4: Time-windowed band threshold ---
         if time_elapsed >= HEDGE_4MIN_AFTER_S:
             band = HEDGE_BAND_3MIN
-            # Force-buy check: if the filled side is priced very high (0.85+),
-            # the hedge side is very cheap. Buy at market immediately.
+            # Force-buy: filled side at 0.85+ means hedge side is very cheap
             filled_ask = ws_feed.get_best_ask(filled_token)
             if filled_ask is not None and filled_ask >= HEDGE_FORCE_BUY_FILLED_THRESHOLD:
                 log.info(
@@ -406,25 +413,44 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         else:
             band = HEDGE_BAND_2MIN
 
-        # --- Step 5: Only buy if still profitable at current hedge price ---
+        # --- Step 5: Sell filled side if hedge becomes uneconomical (after 3min) ---
         if hedge_ask >= band:
-            log.info(
-                "  HEDGE wait: %s ask=%.3f >= band=%.2f (elapsed=%ds)",
-                hedge_side.upper(), hedge_ask, band, time_elapsed,
-            )
+            if time_elapsed >= HEDGE_3MIN_AFTER_S:
+                filled_bal = info.get("filled_bal", SHARES_PER_SIDE)
+                log.info(
+                    "  HEDGE SELL-FILLED: %s ask=%.3f >= band=%.2f at %ds — "
+                    "selling %s %.0f (hedging would cost >$1.00)",
+                    hedge_side.upper(), hedge_ask, band, time_elapsed,
+                    filled_label, filled_bal,
+                )
+                cancel_market_orders(client, {hedge_token})
+                sell_at_bid(client, filled_token, filled_bal, filled_label)
+                info["hedge_done"] = True
+                info["bailed"] = True
+            else:
+                log.info(
+                    "  HEDGE wait: %s ask=%.3f >= band=%.2f (elapsed=%ds)",
+                    hedge_side.upper(), hedge_ask, band, time_elapsed,
+                )
             continue
 
-        # --- Step 6: Trailing-stop trigger — buy on bounce from floor ---
+        # --- Step 6: Dynamic bounce threshold — relax as time runs out ---
+        # Starts at HEDGE_TRAILING_DELTA (0.03) at 120s, decays to ~0.01 at 240s
+        progress = min(1.0, (time_elapsed - HEDGE_START_AFTER_S) /
+                            (HEDGE_4MIN_AFTER_S - HEDGE_START_AFTER_S))
+        min_bounce = HEDGE_TRAILING_DELTA * (1.0 - progress * 0.67)
+
+        # --- Step 7: Trailing-stop trigger — buy on bounce from floor ---
         bounce = hedge_ask - trailing_min
         log.info(
             "  HEDGE trail: %s ask=%.3f low=%.3f bounce=%.3f/%.3f (elapsed=%ds band=%.2f)",
             hedge_side.upper(), hedge_ask, trailing_min,
-            bounce, HEDGE_TRAILING_DELTA, time_elapsed, band,
+            bounce, min_bounce, time_elapsed, band,
         )
-        if bounce >= HEDGE_TRAILING_DELTA:
+        if bounce >= min_bounce:
             log.info(
                 "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f)",
-                hedge_side.upper(), trailing_min, hedge_ask, bounce, HEDGE_TRAILING_DELTA,
+                hedge_side.upper(), trailing_min, hedge_ask, bounce, min_bounce,
             )
             buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
             info["hedge_done"] = True
