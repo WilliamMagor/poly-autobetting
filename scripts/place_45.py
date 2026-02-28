@@ -1,7 +1,7 @@
 """
 Simple script: place 45c limit orders on both UP and DOWN for BTC 5-min markets.
 10 shares each side. Rotates to next market every 5 minutes.
-Auto-redeems resolved positions via Polymarket's gasless relayer.
+Auto-redeems resolved positions via direct on-chain Polygon transaction.
 
 Usage: python scripts/place_45.py
 """
@@ -179,27 +179,24 @@ def init_clob_client():
     return client
 
 
-def init_relayer():
-    """Initialize builder relayer client for gasless redeems."""
-    from py_builder_relayer_client.client import RelayClient
-    from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+def init_redeemer():
+    """Initialize direct on-chain redeemer. Returns (w3, account) or None."""
+    from web3 import Web3
+    from eth_account import Account
 
-    bk = os.getenv("POLYMARKET_BUILDER_API_KEY", "")
-    bs = os.getenv("POLYMARKET_BUILDER_SECRET", "")
-    bp = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "")
-    if not (bk and bs and bp):
-        log.warning("No builder creds — auto-redeem disabled")
+    pk = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+    if not pk:
+        log.warning("No POLYMARKET_PRIVATE_KEY — auto-redeem disabled")
         return None
 
-    builder_config = BuilderConfig(
-        local_builder_creds=BuilderApiKeyCreds(key=bk, secret=bs, passphrase=bp)
-    )
-    return RelayClient(
-        relayer_url="https://relayer-v2.polymarket.com",
-        chain_id=137,
-        private_key=os.environ["POLYMARKET_PRIVATE_KEY"],
-        builder_config=builder_config,
-    )
+    polygon_rpc = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+    w3 = Web3(Web3.HTTPProvider(polygon_rpc))
+    if not w3.is_connected():
+        log.warning("Cannot connect to Polygon RPC (%s) — auto-redeem disabled", polygon_rpc)
+        return None
+
+    account = Account.from_key(pk)
+    return (w3, account)
 
 
 def place_order(client, token_id: str, side_label: str, shares: float, price: float):
@@ -498,55 +495,53 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
             info["bailed"] = True
 
 
-def redeem_market(relayer, condition_id: str, neg_risk: bool) -> bool:
-    """Redeem resolved positions via gasless relayer. Returns True on success."""
+def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0.0, dn_bal: float = 0.0) -> bool:
+    """Redeem resolved positions via direct on-chain Polygon transaction. Returns True on success."""
     from web3 import Web3
-    from eth_abi import encode
-    from py_builder_relayer_client.models import SafeTransaction, OperationType
+
+    w3, account = redeemer
+    cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
 
     if neg_risk:
-        # NegRiskAdapter.redeemPositions(bytes32, uint256[])
-        # We don't know exact amounts, but we can pass max uint for both
-        # Actually for neg-risk we need the adapter address and different encoding
         NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
-        cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
-        # Pass [max, max] — contract will only burn what's available
-        max_uint = 2**256 - 1
-        selector = Web3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
-        params = encode(["bytes32", "uint256[]"], [cond_bytes, [max_uint, max_uint]])
-        target = NEG_RISK_ADAPTER
+        amounts = [int(up_bal * 1e6), int(dn_bal * 1e6)]
+        abi = [{"name": "redeemPositions", "type": "function", "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "amounts", "type": "uint256[]"},
+        ], "outputs": []}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=abi)
+        tx_fn = contract.functions.redeemPositions(cond_bytes, amounts)
     else:
-        # CTF.redeemPositions(address, bytes32, bytes32, uint256[])
-        cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
-        selector = Web3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
-        params = encode(
-            ["address", "bytes32", "bytes32", "uint256[]"],
-            [USDC_ADDRESS, b"\x00" * 32, cond_bytes, [1, 2]],
+        abi = [{"name": "redeemPositions", "type": "function", "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ], "outputs": []}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=abi)
+        tx_fn = contract.functions.redeemPositions(
+            Web3.to_checksum_address(USDC_ADDRESS), b"\x00" * 32, cond_bytes, [1, 2]
         )
-        target = CTF_ADDRESS
-
-    calldata = "0x" + (selector + params).hex()
-    tx = SafeTransaction(to=target, operation=OperationType.Call, data=calldata, value="0")
 
     try:
-        resp = relayer.execute([tx], "Redeem positions")
-        log.info("  Redeem submitted: %s", resp.transaction_id)
-
-        # Poll for result
-        for _ in range(20):
-            time.sleep(3)
-            status = relayer.get_transaction(resp.transaction_id)
-            if isinstance(status, list):
-                status = status[0]
-            state = status.get("state", "")
-            if "CONFIRMED" in state:
-                log.info("  Redeem CONFIRMED: %s", status.get("transactionHash", "")[:20])
-                return True
-            if "FAILED" in state or "INVALID" in state:
-                log.error("  Redeem FAILED: %s", status.get("errorMsg", "")[:80])
-                return False
-        log.warning("  Redeem timeout — check manually")
-        return False
+        nonce = w3.eth.get_transaction_count(account.address)
+        tx = tx_fn.build_transaction({
+            "from": account.address,
+            "nonce": nonce,
+            "gas": 300_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 137,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("  Redeem tx sent: %s", tx_hash.hex()[:20])
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] == 1:
+            log.info("  Redeem CONFIRMED: %s", tx_hash.hex()[:20])
+            return True
+        else:
+            log.error("  Redeem tx FAILED (status=0): %s", tx_hash.hex()[:20])
+            return False
     except Exception as e:
         log.error("  Redeem error: %s", e)
         return False
@@ -564,7 +559,7 @@ def check_token_balance(client, token_id: str) -> float:
         return 0.0
 
 
-async def try_redeem_all(client, relayer, past_markets: dict):
+async def try_redeem_all(client, redeemer, past_markets: dict):
     """Check all past markets and redeem any with unredeemed balances.
 
     Uses conditionId / neg_risk cached at placement time to avoid
@@ -572,7 +567,7 @@ async def try_redeem_all(client, relayer, past_markets: dict):
     get_market_info() fetch when those fields are missing (startup
     scan entries added before this version).
     """
-    if not relayer:
+    if not redeemer:
         return
 
     redeemed = []
@@ -624,7 +619,7 @@ async def try_redeem_all(client, relayer, past_markets: dict):
             continue
 
         log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", title[:50], up_bal, dn_bal)
-        ok = redeem_market(relayer, condition_id, neg_risk)
+        ok = redeem_market(redeemer, condition_id, neg_risk, up_bal, dn_bal)
         if ok:
             info["redeemed"] = True
             redeemed.append(ts)
@@ -645,13 +640,13 @@ async def run():
     
     log.info("Initializing SDK...")
     client = init_clob_client()
-    relayer = init_relayer()
-    
+    redeemer = init_redeemer()
+
     log.info("SDK ready. Placing 45c orders on BTC 5m markets.")
-    if relayer:
-        log.info("Auto-redeem enabled (gasless relayer).\n")
+    if redeemer:
+        log.info("Auto-redeem enabled (on-chain via %s).\n", redeemer[1].address)
     else:
-        log.info("Auto-redeem DISABLED (no builder creds).\n")
+        log.info("Auto-redeem DISABLED (no private key / RPC).\n")
 
     # Start WebSocket feed for real-time prices
     ws_feed = WSBookFeed()
@@ -835,7 +830,7 @@ async def run():
         await check_hedge_trailing(client, ws_feed, past_markets)
 
         # Try redeeming resolved markets
-        await try_redeem_all(client, relayer, past_markets)
+        await try_redeem_all(client, redeemer, past_markets)
 
         # Wait and check for next market
         await asyncio.sleep(5)
