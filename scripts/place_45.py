@@ -183,15 +183,9 @@ def init_clob_client():
         **kwargs,
     )
 
-    api_key = os.getenv("POLYMARKET_API_KEY", "")
-    api_secret = os.getenv("POLYMARKET_API_SECRET", "")
-    passphrase = os.getenv("POLYMARKET_PASSPHRASE", "")
-
-    if api_key and api_secret and passphrase:
-        creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=passphrase)
-    else:
-        creds = client.derive_api_key()
-        log.info("Derived API creds from private key")
+    # Derive API credentials from private key (more reliable than stored creds)
+    creds = client.derive_api_key()
+    log.info("Derived API creds from private key")
     client.set_api_creds(creds)
     return client
 
