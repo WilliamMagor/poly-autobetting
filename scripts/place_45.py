@@ -628,6 +628,21 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
         log.info("  Redeemed %d market(s)", len(redeemed))
 
 
+async def hedge_loop(client, ws_feed: "WSBookFeed", past_markets: dict):
+    """Fast 1-second loop for trailing hedge checks.
+
+    Runs as a background task so hedge triggers aren't delayed by the
+    5-second main loop sleep. Shares past_markets dict by reference —
+    never reassign past_markets in the main loop, only mutate in place.
+    """
+    while True:
+        try:
+            await check_hedge_trailing(client, ws_feed, past_markets)
+        except Exception as e:
+            log.debug("hedge_loop error: %s", e)
+        await asyncio.sleep(1)
+
+
 async def run():
     # Set up signal handler for graceful shutdown
     import signal
@@ -653,7 +668,11 @@ async def run():
 
     placed_markets = set()
     # Track past markets: {ts: {redeemed, bailed, up_token, dn_token, closed}}
+    # NOTE: never reassign this dict — hedge_loop holds a reference to it.
     past_markets = {}
+
+    # Start fast hedge loop (1s interval) as a background task
+    asyncio.create_task(hedge_loop(client, ws_feed, past_markets))
 
     # Scan recent markets (last 2 hours) for unredeemed positions on startup
     now = int(time.time())
@@ -826,10 +845,7 @@ async def run():
                     ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
                 )
 
-        # Run time-windowed trailing hedge for one-sided fills
-        await check_hedge_trailing(client, ws_feed, past_markets)
-
-        # Try redeeming resolved markets
+        # Try redeeming resolved markets (hedge runs in background hedge_loop)
         await try_redeem_all(client, redeemer, past_markets)
 
         # Wait and check for next market
@@ -842,8 +858,11 @@ async def run():
         # Log status with countdown
         log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
-        # Clean very old entries (keep last 2 hours for redemption)
-        past_markets = {ts: v for ts, v in past_markets.items() if ts > now - 7200}
+        # Clean very old entries (keep last 2 hours for redemption).
+        # Use in-place deletion to preserve the reference held by hedge_loop.
+        stale = [ts for ts in past_markets if ts <= now - 7200]
+        for ts in stale:
+            del past_markets[ts]
         # FIX: placed_markets must survive long enough to cover the previous period
         # (next_market_timestamps always returns ts-300 which is ~5 min old).
         # Prune at 2×MARKET_PERIOD so the previous period is never re-placed.
