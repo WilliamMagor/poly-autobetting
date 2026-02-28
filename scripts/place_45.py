@@ -1,6 +1,6 @@
 """
-Simple script: place 45c limit orders on both UP and DOWN for BTC 15-min markets.
-100 shares each side. Rotates to next market every 15 minutes.
+Simple script: place 45c limit orders on both UP and DOWN for BTC 5-min markets.
+10 shares each side. Rotates to next market every 5 minutes.
 Auto-redeems resolved positions via Polymarket's gasless relayer.
 
 Usage: python scripts/place_45.py
@@ -30,45 +30,139 @@ logging.basicConfig(
 )
 log = logging.getLogger("place45")
 
+
+class RateLimiter:
+    """Simple rate limiter for API calls."""
+
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self._calls: list[float] = []
+
+    async def acquire(self):
+        """Wait if necessary to respect rate limits."""
+        now = time.time()
+        # Remove calls outside the window
+        self._calls = [t for t in self._calls if now - t < self.period]
+
+        if len(self._calls) >= self.max_calls:
+            # Wait until oldest call expires
+            wait_time = self.period - (now - self._calls[0]) + 0.1
+            if wait_time > 0:
+                log.debug("Rate limiting: waiting %.2fs", wait_time)
+                await asyncio.sleep(wait_time)
+                self._calls = [t for t in self._calls if time.time() - t < self.period]
+
+        self._calls.append(time.time())
+
+
+# Rate limiter: 10 calls per second max (conservative for Polymarket API)
+_ratelimiter = RateLimiter(max_calls=10, period=1.0)
+
 # --- Config ---
 PRICE = 0.45
-SHARES_PER_SIDE = 100
+SHARES_PER_SIDE = 10     # Reduced for 5min markets (more frequent rotations)
 BAIL_PRICE = 0.72        # if one side > 72c and other side unfilled → bail out
 GAMMA_URL = "https://gamma-api.polymarket.com"
-REF_15M = 1771268400     # known 15m epoch anchor
+MARKET_PERIOD = 300      # 5 minutes (300 seconds)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 
 def next_market_timestamps(now_ts: int) -> list[int]:
-    """Return [currently_trading, next, after_that] 15m market timestamps.
+    """Return [currently_trading, next, after_that] 5m market timestamps.
 
     The slug timestamp is the START time of the market.
     """
-    ts = REF_15M
-    while ts < now_ts:
-        ts += 900
-    # ts = next market to start. ts-900 = currently trading market.
-    return [ts - 900, ts, ts + 900]
+    # 5-minute markets: calculate current period timestamp
+    ts = (now_ts // MARKET_PERIOD) * MARKET_PERIOD
+    # ts = next market to start. ts-300 = currently trading market.
+    return [ts - MARKET_PERIOD, ts, ts + MARKET_PERIOD]
+
+
+def get_market_slug(timestamp: int) -> str:
+    """Return the market slug for a given timestamp (5-minute BTC market)."""
+    return f"btc-updown-5m-{timestamp}"
+
+
+def _validate_token_id(token_id: str, field_name: str) -> str:
+    """Validate that a token ID is a non-empty hex string."""
+    if not token_id or not isinstance(token_id, str):
+        raise ValueError(f"Invalid {field_name}: expected non-empty string, got {token_id}")
+    # Polymarket token IDs are typically numeric strings
+    if not token_id.isdigit():
+        raise ValueError(f"Invalid {field_name}: expected numeric string, got {token_id}")
+    return token_id
+
+
+def _validate_condition_id(condition_id: str) -> str:
+    """Validate that a condition ID is a valid Ethereum-style hex string."""
+    if not condition_id or not isinstance(condition_id, str):
+        raise ValueError(f"Invalid conditionId: expected non-empty string, got {condition_id}")
+    if not condition_id.startswith("0x"):
+        raise ValueError(f"Invalid conditionId: must start with 0x, got {condition_id}")
+    if len(condition_id) < 64:
+        raise ValueError(f"Invalid conditionId: too short, got {condition_id}")
+    return condition_id
 
 
 async def get_market_info(slug: str) -> dict:
-    """Fetch market info from gamma API."""
+    """Fetch market info from gamma API with input validation."""
+    # Validate slug format to prevent injection
+    if not slug or not isinstance(slug, str):
+        raise ValueError(f"Invalid slug: expected non-empty string, got {slug}")
+    if len(slug) > 200:
+        raise ValueError(f"Invalid slug: too long (max 200 chars), got {len(slug)}")
+    # Only allow expected slug pattern
+    import re
+    if not re.match(r"^btc-updown-5m-\d+$", slug):
+        raise ValueError(f"Invalid slug format: expected btc-updown-5m-<timestamp>, got {slug}")
+
+    # Rate limit API calls
+    await _ratelimiter.acquire()
+
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{GAMMA_URL}/events", params={"slug": slug})
         r.raise_for_status()
         data = r.json()
+
     if not data:
         raise ValueError(f"No event found for slug: {slug}")
+
+    # Validate response structure
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError(f"Invalid API response: expected non-empty list, got {type(data)}")
+    if "markets" not in data[0]:
+        raise ValueError(f"Invalid API response: missing 'markets' field")
+    if not isinstance(data[0]["markets"], list) or len(data[0]["markets"]) == 0:
+        raise ValueError(f"Invalid API response: empty markets list")
+
     m = data[0]["markets"][0]
+
+    # Validate required fields exist
+    if "clobTokenIds" not in m:
+        raise ValueError(f"Invalid market: missing 'clobTokenIds' field")
+
     tokens = json.loads(m["clobTokenIds"]) if isinstance(m["clobTokenIds"], str) else m["clobTokenIds"]
+    if not isinstance(tokens, list) or len(tokens) < 2:
+        raise ValueError(f"Invalid clobTokenIds: expected list of 2 tokens, got {tokens}")
+
+    # Validate token IDs
+    up_token = _validate_token_id(tokens[0], "up_token")
+    dn_token = _validate_token_id(tokens[1], "dn_token")
+
+    # Validate and extract conditionId
+    condition_id = m.get("conditionId", "")
+    if condition_id:
+        condition_id = _validate_condition_id(condition_id)
+
     return {
-        "up_token": tokens[0],
-        "dn_token": tokens[1],
+        "up_token": up_token,
+        "dn_token": dn_token,
         "title": m.get("question", slug),
-        "conditionId": m.get("conditionId", ""),
-        "closed": m.get("closed", False),
-        "neg_risk": m.get("negRisk", False),
+        "conditionId": condition_id,
+        "closed": bool(m.get("closed", False)),
+        "neg_risk": bool(m.get("negRisk", False)),
     }
 
 
@@ -326,7 +420,7 @@ async def try_redeem_all(client, relayer, past_markets: dict):
         if info.get("redeemed"):
             continue
 
-        slug = f"btc-updown-15m-{ts}"
+        slug = f"btc-updown-5m-{ts}"
         try:
             mkt = await get_market_info(slug)
         except Exception:
@@ -357,7 +451,7 @@ async def run():
     log.info("Initializing SDK...")
     client = init_clob_client()
     relayer = init_relayer()
-    log.info("SDK ready. Placing 45c orders on BTC 15m markets.")
+    log.info("SDK ready. Placing 45c orders on BTC 5m markets.")
     if relayer:
         log.info("Auto-redeem enabled (gasless relayer).\n")
     else:
@@ -373,11 +467,10 @@ async def run():
     # Scan recent markets (last 2 hours) for unredeemed positions on startup
     now = int(time.time())
     log.info("Scanning recent markets for unredeemed positions...")
-    scan_ts = REF_15M
-    while scan_ts < now - 7200:
-        scan_ts += 900
+    # Scan last 2 hours of 5-minute markets (7200s / 300s = 24 markets)
+    scan_ts = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
     while scan_ts < now:
-        slug = f"btc-updown-15m-{scan_ts}"
+        slug = f"btc-updown-5m-{scan_ts}"
         try:
             mkt = await get_market_info(slug)
             past_markets[scan_ts] = {
@@ -388,7 +481,7 @@ async def run():
             placed_markets.add(scan_ts)
         except Exception:
             pass
-        scan_ts += 900
+        scan_ts += MARKET_PERIOD
     log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
 
     while True:
@@ -399,7 +492,7 @@ async def run():
             if ts in placed_markets:
                 continue
 
-            slug = f"btc-updown-15m-{ts}"
+            slug = f"btc-updown-5m-{ts}"
 
             try:
                 mkt = await get_market_info(slug)
@@ -478,7 +571,7 @@ async def run():
 
         # Clean very old entries (keep last 2 hours for redemption)
         past_markets = {ts: v for ts, v in past_markets.items() if ts > now - 7200}
-        placed_markets = {ts for ts in placed_markets if ts > now - 900}
+        placed_markets = {ts for ts in placed_markets if ts > now - MARKET_PERIOD}
 
 
 if __name__ == "__main__":
