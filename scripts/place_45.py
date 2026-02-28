@@ -34,11 +34,31 @@ log = logging.getLogger("place45")
 # --- Config ---
 PRICE = 0.45
 SHARES_PER_SIDE = 10     # Reduced for 5min markets (more frequent rotations)
-BAIL_PRICE = 0.72        # if one side > 72c and other side unfilled → bail out
+BAIL_PRICE = 0.72        # (legacy) if one side > 72c and other side unfilled → bail out
 GAMMA_URL = "https://gamma-api.polymarket.com"
 MARKET_PERIOD = 300      # 5 minutes (300 seconds)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+# --- Trailing hedge config (from Rust bot analysis) ---
+# Only place initial orders within the first N seconds of a market period.
+# Rust bot uses NEW_MARKET_PLACE_WINDOW_SECONDS = 15.
+NEW_MARKET_PLACE_WINDOW_SECONDS = 15
+# After one side fills, cancel unfilled limit and trail the cheap side.
+# Time windows (seconds elapsed since MARKET START — same anchor as Rust bot):
+HEDGE_START_AFTER_S = 120      # 2-min: start trailing
+HEDGE_3MIN_AFTER_S  = 180      # 3-min: widen band
+HEDGE_4MIN_AFTER_S  = 240      # 4-min: force-buy window
+# Band thresholds: PRICE + hedge_ask must stay below 1.00 to be profitable.
+# band_2min = 1.0 - PRICE - 0.10 = 0.45  (conservative, requires cheap hedge)
+# band_3min = 1.0 - PRICE        = 0.55  (wider, closer to breakeven)
+HEDGE_BAND_2MIN = 1.0 - PRICE - 0.10   # 0.45
+HEDGE_BAND_3MIN = 1.0 - PRICE          # 0.55
+# Trailing delta: buy when ask bounces this much above its lowest point.
+HEDGE_TRAILING_DELTA = 0.03
+# Force-buy threshold at 4-min: if the FILLED side's ask reached this level,
+# the unfilled side is very cheap → buy at market regardless of trailing.
+HEDGE_FORCE_BUY_FILLED_THRESHOLD = 0.85
 
 
 def next_market_timestamps(now_ts: int) -> list[int]:
@@ -242,6 +262,177 @@ def sell_at_bid(client, token_id: str, shares: float, side_label: str) -> str | 
     return None
 
 
+def buy_hedge(client, token_id: str, shares: float, side_label: str, price: float) -> str | None:
+    """Place a limit BUY for the hedge side (post-one-sided-fill).
+
+    Uses the same limit-order path as the original placement but at
+    the current market price rather than the fixed 0.45 entry price.
+    Returns order ID or None on failure.
+    """
+    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client.clob_types import OrderArgs, OrderType
+
+    expiration = int(time.time()) + 600  # 10-min expiry (market ends in <4 min anyway)
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=round(price, 2),
+        size=round(shares, 1),
+        side=BUY,
+        expiration=expiration,
+    )
+    try:
+        signed = client.create_order(order_args)
+        result = client.post_order(signed, OrderType.GTD)
+        oid = result.get("orderID", result.get("id", ""))
+        if oid:
+            log.info("  HEDGE %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
+            return oid
+        else:
+            log.warning("  HEDGE %s no order ID: %s", side_label, result)
+    except Exception as e:
+        log.error("  HEDGE %s order failed: %s", side_label, e)
+    return None
+
+
+async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict):
+    """Time-windowed trailing-stop hedge for one-sided fills.
+
+    Ported from Rust bot (main_dual_limit_045_5m_btc.rs).
+
+    Strategy:
+      After one limit order fills and the other doesn't, the market has moved
+      directionally. Rather than holding a naked directional position to
+      resolution, we:
+        1. Cancel the unfilled limit order (it's now above fair value).
+        2. Track the lowest ask of the unfilled side (trail the floor).
+        3. Buy when the price BOUNCES UP by HEDGE_TRAILING_DELTA (confirms floor).
+        4. Apply progressive band thresholds so we only buy if profitable:
+             120-180s: hedge_ask < HEDGE_BAND_2MIN (0.45)  →  total < 0.90
+             180-240s: hedge_ask < HEDGE_BAND_3MIN (0.55)  →  total < 1.00
+        5. At 240s+: force-buy if the FILLED side's ask >= 0.85 (the market is
+           very confident, so the unfilled side is now very cheap ~0.15).
+
+    Timing anchor: placed_at == ts (market START timestamp), so time_elapsed
+    mirrors the Rust bot's (MARKET_PERIOD - time_remaining_seconds) exactly.
+
+    State stored per market in past_markets:
+      hedge_side:        "up" | "dn" | None  — which side needs to be hedged
+      hedge_cancelled:   bool — unfilled limit was cancelled
+      hedge_done:        bool — hedge buy was placed
+      trailing_min_ask:  float | None — lowest ask seen for unfilled side
+    """
+    now = int(time.time())
+
+    for ts, info in list(past_markets.items()):
+        # Skip markets that are fully handled
+        if info.get("hedge_done") or info.get("redeemed") or info.get("closed"):
+            continue
+
+        up_token = info.get("up_token", "")
+        dn_token = info.get("dn_token", "")
+        placed_at = info.get("placed_at", 0)
+        if not up_token or not dn_token or not placed_at:
+            continue
+
+        time_elapsed = now - placed_at
+
+        # Don't start hedge logic until 2 minutes into the market
+        if time_elapsed < HEDGE_START_AFTER_S:
+            continue
+
+        # --- Step 1: Detect one-sided fill (once, then cache result) ---
+        if not info.get("hedge_side"):
+            try:
+                up_bal = check_token_balance(client, up_token)
+                dn_bal = check_token_balance(client, dn_token)
+            except Exception:
+                continue
+
+            if up_bal > 0 and dn_bal == 0:
+                hedge_side = "dn"
+            elif dn_bal > 0 and up_bal == 0:
+                hedge_side = "up"
+            else:
+                # Both filled (complete set) or neither filled — nothing to do
+                continue
+
+            log.info(
+                "  HEDGE detected one-sided fill at %ds: %s filled, need to hedge %s",
+                time_elapsed,
+                "UP" if hedge_side == "dn" else "DN",
+                hedge_side.upper(),
+            )
+            info["hedge_side"] = hedge_side
+            info["trailing_min_ask"] = None
+
+        hedge_side: str = info["hedge_side"]
+        hedge_token = up_token if hedge_side == "up" else dn_token
+        filled_token = dn_token if hedge_side == "up" else up_token
+
+        # --- Step 2: Cancel unfilled limit (once) ---
+        if not info.get("hedge_cancelled"):
+            log.info("  HEDGE cancelling unfilled %s limit", hedge_side.upper())
+            cancel_market_orders(client, {hedge_token})
+            info["hedge_cancelled"] = True
+
+        # --- Step 3: Get current ask for the hedge side from WS ---
+        hedge_ask = ws_feed.get_best_ask(hedge_token)
+        if hedge_ask is None:
+            continue
+
+        # Update trailing minimum
+        prev_min = info.get("trailing_min_ask")
+        if prev_min is None or hedge_ask < prev_min:
+            info["trailing_min_ask"] = hedge_ask
+            if prev_min is not None:
+                log.info("  HEDGE trail: new low for %s ask=%.3f", hedge_side.upper(), hedge_ask)
+
+        trailing_min = info["trailing_min_ask"]
+
+        # --- Step 4: Time-windowed band threshold ---
+        if time_elapsed >= HEDGE_4MIN_AFTER_S:
+            band = HEDGE_BAND_3MIN
+            # Force-buy check: if the filled side is priced very high (0.85+),
+            # the hedge side is very cheap. Buy at market immediately.
+            filled_ask = ws_feed.get_best_ask(filled_token)
+            if filled_ask is not None and filled_ask >= HEDGE_FORCE_BUY_FILLED_THRESHOLD:
+                log.info(
+                    "  HEDGE FORCE-BUY: filled side ask=%.2f >= %.2f, hedge %s ask=%.3f",
+                    filled_ask, HEDGE_FORCE_BUY_FILLED_THRESHOLD,
+                    hedge_side.upper(), hedge_ask,
+                )
+                buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
+                info["hedge_done"] = True
+                continue
+        elif time_elapsed >= HEDGE_3MIN_AFTER_S:
+            band = HEDGE_BAND_3MIN
+        else:
+            band = HEDGE_BAND_2MIN
+
+        # --- Step 5: Only buy if still profitable at current hedge price ---
+        if hedge_ask >= band:
+            log.info(
+                "  HEDGE wait: %s ask=%.3f >= band=%.2f (elapsed=%ds)",
+                hedge_side.upper(), hedge_ask, band, time_elapsed,
+            )
+            continue
+
+        # --- Step 6: Trailing-stop trigger — buy on bounce from floor ---
+        bounce = hedge_ask - trailing_min
+        log.info(
+            "  HEDGE trail: %s ask=%.3f low=%.3f bounce=%.3f/%.3f (elapsed=%ds band=%.2f)",
+            hedge_side.upper(), hedge_ask, trailing_min,
+            bounce, HEDGE_TRAILING_DELTA, time_elapsed, band,
+        )
+        if bounce >= HEDGE_TRAILING_DELTA:
+            log.info(
+                "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f)",
+                hedge_side.upper(), trailing_min, hedge_ask, bounce, HEDGE_TRAILING_DELTA,
+            )
+            buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
+            info["hedge_done"] = True
+
+
 def cancel_market_orders(client, token_ids: set):
     """Cancel all live orders for the given token IDs."""
     try:
@@ -374,7 +565,13 @@ def check_token_balance(client, token_id: str) -> float:
 
 
 async def try_redeem_all(client, relayer, past_markets: dict):
-    """Check all past markets and redeem any with unredeemed balances."""
+    """Check all past markets and redeem any with unredeemed balances.
+
+    Uses conditionId / neg_risk cached at placement time to avoid
+    one API call per market per loop tick.  Falls back to a fresh
+    get_market_info() fetch when those fields are missing (startup
+    scan entries added before this version).
+    """
     if not relayer:
         return
 
@@ -383,25 +580,51 @@ async def try_redeem_all(client, relayer, past_markets: dict):
         if info.get("redeemed"):
             continue
 
-        slug = f"btc-updown-5m-{ts}"
-        try:
-            mkt = await get_market_info(slug)
-        except Exception:
+        up_token = info.get("up_token", "")
+        dn_token = info.get("dn_token", "")
+        condition_id = info.get("condition_id", "")
+        neg_risk = info.get("neg_risk", False)
+        title = info.get("title", f"btc-updown-5m-{ts}")
+
+        # Determine if market is closed — prefer cached flag, fallback to API
+        if not info.get("closed"):
+            # Fetch only if we don't already know it's closed
+            slug = f"btc-updown-5m-{ts}"
+            try:
+                mkt = await get_market_info(slug)
+            except Exception:
+                continue
+            if not mkt["closed"]:
+                continue  # not resolved yet
+            # Cache the closed state and fill in any missing fields
+            info["closed"] = True
+            if not condition_id:
+                condition_id = mkt["conditionId"]
+                info["condition_id"] = condition_id
+            if not neg_risk:
+                neg_risk = mkt.get("neg_risk", False)
+                info["neg_risk"] = neg_risk
+            if not up_token:
+                up_token = mkt["up_token"]
+                info["up_token"] = up_token
+            if not dn_token:
+                dn_token = mkt["dn_token"]
+                info["dn_token"] = dn_token
+
+        if not condition_id:
+            log.warning("  No conditionId for %s — cannot redeem", title[:40])
             continue
 
-        if not mkt["closed"]:
-            continue  # not resolved yet
-
         # Check if we hold any tokens
-        up_bal = check_token_balance(client,mkt["up_token"])
-        dn_bal = check_token_balance(client,mkt["dn_token"])
+        up_bal = check_token_balance(client, up_token)
+        dn_bal = check_token_balance(client, dn_token)
 
         if up_bal <= 0 and dn_bal <= 0:
             info["redeemed"] = True  # nothing to redeem
             continue
 
-        log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", mkt["title"][:50], up_bal, dn_bal)
-        ok = redeem_market(relayer, mkt["conditionId"], mkt.get("neg_risk", False))
+        log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", title[:50], up_bal, dn_bal)
+        ok = redeem_market(relayer, condition_id, neg_risk)
         if ok:
             info["redeemed"] = True
             redeemed.append(ts)
@@ -448,10 +671,22 @@ async def run():
             mkt = await get_market_info(slug)
             past_markets[scan_ts] = {
                 "redeemed": False,
+                "closed": mkt["closed"],
                 "up_token": mkt["up_token"],
                 "dn_token": mkt["dn_token"],
+                "condition_id": mkt["conditionId"],
+                "neg_risk": mkt.get("neg_risk", False),
+                "title": mkt.get("title", slug),
+                # placed_at unknown for startup-scanned markets; hedge won't activate
+                "placed_at": 0,
             }
             placed_markets.add(scan_ts)
+            # Subscribe to WS feed so prices are available for active markets
+            if not mkt["closed"]:
+                if not ws_feed.is_connected:
+                    await ws_feed.start([mkt["up_token"], mkt["dn_token"]])
+                else:
+                    await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
         except Exception:
             pass
         scan_ts += MARKET_PERIOD
@@ -495,7 +730,17 @@ async def run():
             if up_bal > 0 or dn_bal > 0:
                 log.info("  Already have position (UP=%.1f, DN=%.1f) — skipping", up_bal, dn_bal)
                 placed_markets.add(ts)
-                past_markets[ts] = {"redeemed": False, "up_token": mkt["up_token"], "dn_token": mkt["dn_token"]}
+                past_markets[ts] = {
+                    "redeemed": False,
+                    "closed": mkt["closed"],
+                    "up_token": mkt["up_token"],
+                    "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    # placed_at unknown (pre-existing position); hedge won't activate
+                    "placed_at": 0,
+                }
                 continue
 
             # Skip if we already have live orders on this market
@@ -508,10 +753,42 @@ async def run():
                 if existing:
                     log.info("  Already have %d live order(s) — skipping", len(existing))
                     placed_markets.add(ts)
-                    past_markets[ts] = {"redeemed": False, "up_token": mkt["up_token"], "dn_token": mkt["dn_token"]}
+                    past_markets[ts] = {
+                        "redeemed": False,
+                        "closed": mkt["closed"],
+                        "up_token": mkt["up_token"],
+                        "dn_token": mkt["dn_token"],
+                        "condition_id": mkt["conditionId"],
+                        "neg_risk": mkt.get("neg_risk", False),
+                        "title": mkt.get("title", slug),
+                        # placed_at unknown (pre-existing orders); hedge won't activate
+                        "placed_at": 0,
+                    }
                     continue
             except Exception:
                 pass  # if check fails, proceed with placement
+
+            # Enforce 15-second placement window (matching Rust bot).
+            # ts is the market START timestamp; secs_elapsed is negative for
+            # future markets (we still pre-register them) and 0-300 for live ones.
+            secs_elapsed = now - ts
+            if secs_elapsed > NEW_MARKET_PLACE_WINDOW_SECONDS:
+                log.info(
+                    "  Skipping placement — outside %ds window (%ds elapsed since market start)",
+                    NEW_MARKET_PLACE_WINDOW_SECONDS, secs_elapsed,
+                )
+                placed_markets.add(ts)
+                past_markets[ts] = {
+                    "redeemed": False,
+                    "closed": mkt["closed"],
+                    "up_token": mkt["up_token"],
+                    "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    "placed_at": 0,  # no orders placed; hedge won't activate
+                }
+                continue
 
             up_id = place_order(client, mkt["up_token"], "UP  ", SHARES_PER_SIDE, PRICE)
             dn_id = place_order(client, mkt["dn_token"], "DOWN", SHARES_PER_SIDE, PRICE)
@@ -521,37 +798,61 @@ async def run():
             log.info("")
 
             placed_markets.add(ts)
-            past_markets[ts] = {"redeemed": False, "up_token": mkt["up_token"], "dn_token": mkt["dn_token"]}
+            past_markets[ts] = {
+                "redeemed": False,
+                "closed": mkt["closed"],
+                "up_token": mkt["up_token"],
+                "dn_token": mkt["dn_token"],
+                "condition_id": mkt["conditionId"],
+                "neg_risk": mkt.get("neg_risk", False),
+                "title": mkt.get("title", slug),
+                # FIX: use market start timestamp (ts) as anchor, not wall-clock
+                # placement time. Matches Rust bot: time_elapsed = now - ts, so
+                # hedge windows (120s, 180s, 240s) are relative to market start,
+                # not to when place_order() returned.
+                "placed_at": ts,
+            }
 
-        # Log WS prices for active markets
+        # Log WS prices for active (unresolved, unhedged) markets
         for ts, info in past_markets.items():
-            if info.get("bailed") or info.get("redeemed"):
+            if info.get("redeemed") or info.get("closed"):
                 continue
             up_ask = ws_feed.get_best_ask(info.get("up_token", ""))
             dn_ask = ws_feed.get_best_ask(info.get("dn_token", ""))
             if up_ask is not None or dn_ask is not None:
-                log.info("  [%d] WS prices: UP ask=%.2f  DN ask=%.2f",
-                         ts, up_ask or 0, dn_ask or 0)
+                elapsed = now - info.get("placed_at", now)
+                hedge_state = ""
+                if info.get("hedge_done"):
+                    hedge_state = " [HEDGED]"
+                elif info.get("hedge_side"):
+                    hedge_state = f" [TRAILING {info['hedge_side'].upper()}]"
+                log.info(
+                    "  [%d +%ds] WS: UP=%.2f  DN=%.2f%s",
+                    ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
+                )
 
-        # Bail-out disabled — holding through resolution is +EV at 45c entry
-        # await check_bail_out(client, ws_feed, past_markets)
+        # Run time-windowed trailing hedge for one-sided fills
+        await check_hedge_trailing(client, ws_feed, past_markets)
 
         # Try redeeming resolved markets
         await try_redeem_all(client, relayer, past_markets)
 
-        # Wait and check for next market (shorter interval for more responsive market detection)
+        # Wait and check for next market
         await asyncio.sleep(5)
 
         # Calculate time until next market
         next_market_ts = (now // MARKET_PERIOD) * MARKET_PERIOD + MARKET_PERIOD
         seconds_until = next_market_ts - now
-        
+
         # Log status with countdown
         log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
         # Clean very old entries (keep last 2 hours for redemption)
         past_markets = {ts: v for ts, v in past_markets.items() if ts > now - 7200}
-        placed_markets = {ts for ts in placed_markets if ts > now - MARKET_PERIOD}
+        # FIX: placed_markets must survive long enough to cover the previous period
+        # (next_market_timestamps always returns ts-300 which is ~5 min old).
+        # Prune at 2×MARKET_PERIOD so the previous period is never re-placed.
+        placed_markets = {ts for ts in placed_markets if ts > now - 2 * MARKET_PERIOD}
 
 
 if __name__ == "__main__":
