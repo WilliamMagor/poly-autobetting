@@ -1,9 +1,26 @@
 """
 Simple script: place 45c limit orders on both UP and DOWN for BTC 5-min markets.
 10 shares each side. Rotates to next market every 5 minutes.
-Auto-redeems resolved positions via direct on-chain Polygon transaction.
+- Auto-merges complete sets (UP+DN) into USDC on-chain only after the market has ended.
+- Auto-redeems resolved positions (remaining tokens) via direct on-chain Polygon transaction.
+
+Optional env: PLACE_45_MAX_OPEN_MARKETS (cap open markets), PLACE_45_REST_FALLBACK=1 (REST ask fallback).
 
 Usage: python scripts/place_45.py
+
+--- Bail vs Hedge (one-sided fill) ---
+  BAIL: When only one side filled and the *other* side's ask goes above 0.72 (BAIL_PRICE),
+  we sell the side we hold (the "losing" side) at the bid and cancel orders. That exits
+  the naked directional risk instead of holding to resolution (where the loser goes to $0).
+  So bail does not buy the other side; it cuts losses by selling what we have.
+
+  HEDGE (trailing): We *do* buy the unfilled side to complete the set, but only when
+  it's cheap enough (bands) and when price has bounced off a floor (trailing stop):
+  - 2-min window (120–180s): band 0.45 → only buy if hedge_ask < 0.45; trigger when
+    ask >= lowest_ask + 0.03 (HEDGE_TRAILING_DELTA).
+  - 3-min window (180–240s): band 0.55 → buy if hedge_ask < 0.55; same trailing idea,
+    min_bounce relaxes to ~0.01 by 240s.
+  So we track lowest_ask on the unfilled side and buy when ask bounces up by the delta.
 """
 
 import asyncio
@@ -56,7 +73,7 @@ def log_trade(event: str, **fields):
 # --- Config ---
 PRICE = 0.45
 SHARES_PER_SIDE = 10     # Reduced for 5min markets (more frequent rotations)
-BAIL_PRICE = 0.72        # (legacy) if one side > 72c and other side unfilled → bail out
+BAIL_PRICE = 0.72        # if one side's ask > 72c and we only hold the other → sell held side (exit risk)
 GAMMA_URL = "https://gamma-api.polymarket.com"
 MARKET_PERIOD = 300      # 5 minutes (300 seconds)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -81,6 +98,15 @@ HEDGE_TRAILING_DELTA = 0.03
 # Force-buy threshold at 4-min: if the FILLED side's ask reached this level,
 # the unfilled side is very cheap → buy at market regardless of trailing.
 HEDGE_FORCE_BUY_FILLED_THRESHOLD = 0.85
+
+# --- Risk limits (optional) ---
+# Max number of markets we have open orders or positions in (0 = no cap)
+MAX_OPEN_MARKETS = int(os.getenv("PLACE_45_MAX_OPEN_MARKETS", "0"))
+# If WS has no ask, fall back to REST order book for hedge/bail (slower but safer)
+HEDGE_USE_REST_FALLBACK = os.getenv("PLACE_45_REST_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
+
+# --- Speed: pre-fetch next market when this many seconds until start
+NEXT_MARKET_PREFETCH_SEC = 60
 
 
 def next_market_timestamps(now_ts: int) -> list[int]:
@@ -247,7 +273,7 @@ def place_order(client, token_id: str, side_label: str, shares: float, price: fl
         except Exception as e:
             log.warning("  %s order failed (attempt %d/3): %s", side_label, attempt, e)
         if attempt < 3:
-            time.sleep(2)
+            time.sleep(1)  # shorter delay for faster retry at market open
     log.error("  %s order failed after 3 attempts", side_label)
     return None
 
@@ -359,8 +385,8 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
     now = int(time.time())
 
     for ts, info in list(past_markets.items()):
-        # Skip markets that are fully handled
-        if info.get("hedge_done") or info.get("redeemed") or info.get("closed"):
+        # Skip markets that are fully handled (bailed = we already sold filled side)
+        if info.get("hedge_done") or info.get("redeemed") or info.get("closed") or info.get("bailed"):
             continue
 
         up_token = info.get("up_token", "")
@@ -407,7 +433,7 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         filled_label = "UP" if hedge_side == "dn" else "DN"
 
         # --- Step 2: Track trailing minimum from fill detection (before 120s) ---
-        hedge_ask = ws_feed.get_best_ask(hedge_token)
+        hedge_ask = get_best_ask_safe(ws_feed, client, hedge_token)
         if hedge_ask is None:
             continue
 
@@ -433,7 +459,7 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         if time_elapsed >= HEDGE_4MIN_AFTER_S:
             band = HEDGE_BAND_3MIN
             # Force-buy: filled side at 0.85+ means hedge side is very cheap
-            filled_ask = ws_feed.get_best_ask(filled_token)
+            filled_ask = get_best_ask_safe(ws_feed, client, filled_token)
             if filled_ask is not None and filled_ask >= HEDGE_FORCE_BUY_FILLED_THRESHOLD:
                 log.info(
                     "  HEDGE FORCE-BUY: filled side ask=%.2f >= %.2f, hedge %s ask=%.3f",
@@ -465,18 +491,25 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                 )
                 # Fall through to Steps 6-7 below
             elif time_elapsed >= HEDGE_3MIN_AFTER_S:
-                filled_bal = info.get("filled_bal", SHARES_PER_SIDE)
+                # Use current balance so we don't try to sell more than we hold (e.g. after manual sell or bail)
+                try:
+                    sell_bal = check_token_balance(client, filled_token)
+                except Exception:
+                    sell_bal = info.get("filled_bal", SHARES_PER_SIDE)
+                if sell_bal <= 0:
+                    info["hedge_done"] = True
+                    continue
                 log.info(
                     "  HEDGE SELL-FILLED: %s ask=%.3f >= band=%.2f at %ds — "
                     "selling %s %.0f (hedging would cost >$1.00)",
                     hedge_side.upper(), hedge_ask, band, time_elapsed,
-                    filled_label, filled_bal,
+                    filled_label, sell_bal,
                 )
                 log_trade("hedge_sell_filled", market_ts=ts, hedge_side=hedge_side.upper(),
-                          hedge_ask=hedge_ask, band=band, filled_bal=filled_bal,
+                          hedge_ask=hedge_ask, band=band, filled_bal=sell_bal,
                           elapsed_s=time_elapsed)
                 cancel_market_orders(client, {hedge_token})
-                sell_at_bid(client, filled_token, filled_bal, filled_label)
+                sell_at_bid(client, filled_token, sell_bal, filled_label)
                 info["hedge_done"] = True
                 info["bailed"] = True
                 continue
@@ -494,6 +527,8 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         min_bounce = HEDGE_TRAILING_DELTA * (1.0 - progress * 0.67)
 
         # --- Step 7: Trailing-stop trigger — buy on bounce from floor ---
+        if trailing_min is None:
+            continue  # no floor yet (e.g. WS had no data until now)
         bounce = hedge_ask - trailing_min
         log.info(
             "  HEDGE trail: %s ask=%.3f low=%.3f bounce=%.3f/%.3f (elapsed=%ds band=%.2f)",
@@ -530,6 +565,22 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
             info["hedge_done"] = True
 
 
+def get_best_ask_safe(ws_feed: "WSBookFeed", client, token_id: str) -> float | None:
+    """Best ask from WS; if None and HEDGE_USE_REST_FALLBACK, fetch from REST order book."""
+    ask = ws_feed.get_best_ask(token_id)
+    if ask is not None:
+        return ask
+    if not HEDGE_USE_REST_FALLBACK:
+        return None
+    try:
+        book = client.get_order_book(token_id)
+        if book and book.asks:
+            return float(book.asks[0].price)
+    except Exception:
+        pass
+    return None
+
+
 def cancel_market_orders(client, token_ids: set):
     """Cancel all live orders for the given token IDs."""
     try:
@@ -559,11 +610,11 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
         if info.get("closed"):
             continue  # already resolved, redeem handles it
 
-        # Get prices from WS feed (real-time, no API call)
-        up_ask = ws_feed.get_best_ask(up_token)
-        dn_ask = ws_feed.get_best_ask(dn_token)
+        # Get prices from WS feed (or REST fallback if enabled)
+        up_ask = get_best_ask_safe(ws_feed, client, up_token)
+        dn_ask = get_best_ask_safe(ws_feed, client, dn_token)
         if up_ask is None or dn_ask is None:
-            continue  # no WS data yet
+            continue  # no price data yet
 
         if up_ask <= BAIL_PRICE and dn_ask <= BAIL_PRICE:
             continue  # no bail needed
@@ -593,6 +644,51 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
 
         if bail:
             info["bailed"] = True
+
+
+def merge_market(redeemer, condition_id: str, amount: float) -> bool:
+    """Merge complete sets (1 UP + 1 DN) into USDC on-chain. Can be done before or after resolution.
+    amount = number of full sets to merge (min of UP and DN balances). Returns True on success."""
+    from web3 import Web3
+
+    w3, account = redeemer
+    cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
+    amount_wei = int(amount * 1e6)  # USDC 6 decimals
+    if amount_wei <= 0:
+        return False
+
+    abi = [{"name": "mergePositions", "type": "function", "inputs": [
+        {"name": "collateralToken", "type": "address"},
+        {"name": "parentCollectionId", "type": "bytes32"},
+        {"name": "conditionId", "type": "bytes32"},
+        {"name": "partition", "type": "uint256[]"},
+        {"name": "amount", "type": "uint256"},
+    ], "outputs": []}]
+    contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=abi)
+    tx_fn = contract.functions.mergePositions(
+        Web3.to_checksum_address(USDC_ADDRESS), b"\x00" * 32, cond_bytes, [1, 2], amount_wei
+    )
+    try:
+        nonce = w3.eth.get_transaction_count(account.address)
+        tx = tx_fn.build_transaction({
+            "from": account.address,
+            "nonce": nonce,
+            "gas": 200_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 137,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("  Merge tx sent: %s (%s sets)", tx_hash.hex()[:20], amount)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] == 1:
+            log.info("  Merge CONFIRMED: %s", tx_hash.hex()[:20])
+            return True
+        log.error("  Merge tx FAILED (status=0): %s", tx_hash.hex()[:20])
+        return False
+    except Exception as e:
+        log.error("  Merge error: %s", e)
+        return False
 
 
 def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0.0, dn_bal: float = 0.0) -> bool:
@@ -731,6 +827,61 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
         log.info("  Redeemed %d market(s)", len(redeemed))
 
 
+async def try_merge_all(client, redeemer, past_markets: dict):
+    """Merge complete sets (UP + DN) into USDC only after the market has ended (closed).
+    Run before redeem: merge first (get $1 per set back), then redeem any remaining."""
+    if not redeemer:
+        return
+
+    merged = []
+    for ts, info in list(past_markets.items()):
+        if info.get("redeemed"):
+            continue
+
+        up_token = info.get("up_token", "")
+        dn_token = info.get("dn_token", "")
+        condition_id = info.get("condition_id", "")
+        title = info.get("title", f"btc-updown-5m-{ts}")
+
+        # Only merge after market has ended (same as redeem)
+        if not info.get("closed"):
+            slug = f"btc-updown-5m-{ts}"
+            try:
+                mkt = await get_market_info(slug)
+            except Exception:
+                continue
+            if not mkt["closed"]:
+                continue  # market not ended yet
+            info["closed"] = True
+            if not condition_id:
+                condition_id = mkt["conditionId"]
+                info["condition_id"] = condition_id
+            if not up_token:
+                up_token = mkt["up_token"]
+                info["up_token"] = up_token
+            if not dn_token:
+                dn_token = mkt["dn_token"]
+                info["dn_token"] = dn_token
+
+        if not condition_id:
+            continue
+
+        up_bal = check_token_balance(client, up_token)
+        dn_bal = check_token_balance(client, dn_token)
+        merge_amount = min(up_bal, dn_bal)
+        if merge_amount <= 0:
+            continue
+
+        log.info("  Merging %s (%.1f complete sets)...", title[:50], merge_amount)
+        ok = merge_market(redeemer, condition_id, merge_amount)
+        log_trade("merge", market_ts=ts, title=title, sets=merge_amount, ok=ok)
+        if ok:
+            merged.append(ts)
+
+    if merged:
+        log.info("  Merged %d market(s)", len(merged))
+
+
 async def hedge_loop(client, ws_feed: "WSBookFeed", past_markets: dict):
     """Fast 1-second loop for trailing hedge checks.
 
@@ -811,9 +962,23 @@ async def run():
         scan_ts += MARKET_PERIOD
     log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
 
+    # Pre-fetch cache for next market (avoids get_market_info wait when new period starts)
+    next_market_cache = {"ts": None, "mkt": None}
+
+    async def prefetch_next_market(next_ts: int, cache: dict):
+        if cache.get("ts") == next_ts:
+            return
+        try:
+            mkt = await get_market_info(f"btc-updown-5m-{next_ts}")
+            cache["ts"] = next_ts
+            cache["mkt"] = mkt
+        except Exception:
+            pass
+
     while True:
         now = int(time.time())
         timestamps = next_market_timestamps(now)
+        next_market_ts = (now // MARKET_PERIOD) * MARKET_PERIOD + MARKET_PERIOD
 
         for ts in timestamps:
             if ts in placed_markets:
@@ -821,11 +986,17 @@ async def run():
 
             slug = f"btc-updown-5m-{ts}"
 
-            try:
-                mkt = await get_market_info(slug)
-            except Exception as e:
-                log.debug("Market %s not available yet: %s", slug, e)
-                continue
+            # Use pre-fetched market data if we have it (saves one round-trip at market open)
+            if ts == next_market_ts and next_market_cache.get("ts") == ts and next_market_cache.get("mkt"):
+                mkt = next_market_cache["mkt"]
+                next_market_cache["ts"] = None
+                next_market_cache["mkt"] = None
+            else:
+                try:
+                    mkt = await get_market_info(slug)
+                except Exception as e:
+                    log.debug("Market %s not available yet: %s", slug, e)
+                    continue
 
             secs_until = ts - now
 
@@ -843,9 +1014,17 @@ async def run():
             else:
                 await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
 
-            # Skip if we already hold tokens (filled from previous run or restart)
-            up_bal = check_token_balance(client, mkt["up_token"])
-            dn_bal = check_token_balance(client, mkt["dn_token"])
+            # Balance + live orders in parallel (one round-trip instead of three)
+            def _get_orders():
+                try:
+                    return client.get_orders()
+                except Exception:
+                    return []
+            up_bal, dn_bal, live_orders = await asyncio.gather(
+                asyncio.to_thread(check_token_balance, client, mkt["up_token"]),
+                asyncio.to_thread(check_token_balance, client, mkt["dn_token"]),
+                asyncio.to_thread(_get_orders),
+            )
             if up_bal > 0 or dn_bal > 0:
                 log.info("  Already have position (UP=%.1f, DN=%.1f) — skipping", up_bal, dn_bal)
                 placed_markets.add(ts)
@@ -862,30 +1041,26 @@ async def run():
                 }
                 continue
 
-            # Skip if we already have live orders on this market
-            try:
-                live_orders = client.get_orders()
-                market_tokens = {mkt["up_token"], mkt["dn_token"]}
-                existing = [o for o in live_orders
-                            if o.get("status") == "LIVE"
-                            and o.get("asset_id") in market_tokens]
-                if existing:
-                    log.info("  Already have %d live order(s) — skipping", len(existing))
-                    placed_markets.add(ts)
-                    past_markets[ts] = {
-                        "redeemed": False,
-                        "closed": mkt["closed"],
-                        "up_token": mkt["up_token"],
-                        "dn_token": mkt["dn_token"],
-                        "condition_id": mkt["conditionId"],
-                        "neg_risk": mkt.get("neg_risk", False),
-                        "title": mkt.get("title", slug),
-                        # Use ts so hedge activates when one of these orders fills
-                        "placed_at": ts,
-                    }
-                    continue
-            except Exception:
-                pass  # if check fails, proceed with placement
+            # Skip if we already have live orders on this market (live_orders from parallel fetch above)
+            market_tokens = {mkt["up_token"], mkt["dn_token"]}
+            existing = [o for o in (live_orders or [])
+                        if o.get("status") == "LIVE"
+                        and o.get("asset_id") in market_tokens]
+            if existing:
+                log.info("  Already have %d live order(s) — skipping", len(existing))
+                placed_markets.add(ts)
+                past_markets[ts] = {
+                    "redeemed": False,
+                    "closed": mkt["closed"],
+                    "up_token": mkt["up_token"],
+                    "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    # Use ts so hedge activates when one of these orders fills
+                    "placed_at": ts,
+                }
+                continue
 
             # Enforce 15-second placement window (matching Rust bot).
             # ts is the market START timestamp; secs_elapsed is negative for
@@ -910,8 +1085,22 @@ async def run():
                 }
                 continue
 
-            up_id = place_order(client, mkt["up_token"], "UP  ", SHARES_PER_SIDE, PRICE)
-            dn_id = place_order(client, mkt["dn_token"], "DOWN", SHARES_PER_SIDE, PRICE)
+            # Optional cap: don't open new markets if we're at max open (risk limit)
+            if MAX_OPEN_MARKETS > 0:
+                open_count = sum(1 for _ts, _info in past_markets.items() if not _info.get("redeemed"))
+                if open_count >= MAX_OPEN_MARKETS:
+                    log.info(
+                        "  Skipping placement — at max open markets (%d >= %d)",
+                        open_count, MAX_OPEN_MARKETS,
+                    )
+                    log_trade("max_open_skipped", market_ts=ts, slug=slug, open_count=open_count, max=MAX_OPEN_MARKETS)
+                    continue  # retry next loop when a slot frees
+
+            # Place both sides in parallel so they hit the book at nearly the same time
+            up_id, dn_id = await asyncio.gather(
+                asyncio.to_thread(place_order, client, mkt["up_token"], "UP  ", SHARES_PER_SIDE, PRICE),
+                asyncio.to_thread(place_order, client, mkt["dn_token"], "DOWN", SHARES_PER_SIDE, PRICE),
+            )
 
             placed = (1 if up_id else 0) + (1 if dn_id else 0)
             log.info("  Done: %d orders placed. Max cost: $%.2f", placed, SHARES_PER_SIDE * PRICE * 2)
@@ -955,15 +1144,20 @@ async def run():
                     ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
                 )
 
-        # Try redeeming resolved markets (hedge runs in background hedge_loop)
+        # Bail out early if one side > 72c and we hold the other (sell filled side)
+        await check_bail_out(client, ws_feed, past_markets)
+        # Merge complete sets (UP+DN) into USDC only after market has ended
+        await try_merge_all(client, redeemer, past_markets)
+        # Redeem resolved markets (remaining winning/losing tokens after resolution)
         await try_redeem_all(client, redeemer, past_markets)
 
-        # Wait and check for next market
-        await asyncio.sleep(5)
-
-        # Calculate time until next market
-        next_market_ts = (now // MARKET_PERIOD) * MARKET_PERIOD + MARKET_PERIOD
+        # Faster poll when close to next market start (better chance to fill both sides)
         seconds_until = next_market_ts - now
+        sleep_s = 0.5 if seconds_until <= 15 else (1 if seconds_until <= 60 else 2)
+        # Pre-fetch next market in background so we have it when the new period starts
+        if seconds_until <= NEXT_MARKET_PREFETCH_SEC and seconds_until > 0:
+            asyncio.create_task(prefetch_next_market(next_market_ts, next_market_cache))
+        await asyncio.sleep(sleep_s)
 
         # Log status with countdown
         log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
