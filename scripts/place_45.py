@@ -212,17 +212,21 @@ def place_order(client, token_id: str, side_label: str, shares: float, price: fl
         side=BUY,
         expiration=expiration,
     )
-    try:
-        signed = client.create_order(order_args)
-        result = client.post_order(signed, OrderType.GTD)
-        oid = result.get("orderID", result.get("id", ""))
-        if oid:
-            log.info("  %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
-            return oid
-        else:
-            log.warning("  %s no order ID: %s", side_label, result)
-    except Exception as e:
-        log.error("  %s order failed: %s", side_label, e)
+    for attempt in range(1, 4):
+        try:
+            signed = client.create_order(order_args)
+            result = client.post_order(signed, OrderType.GTD)
+            oid = result.get("orderID", result.get("id", ""))
+            if oid:
+                log.info("  %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
+                return oid
+            else:
+                log.warning("  %s no order ID: %s", side_label, result)
+        except Exception as e:
+            log.warning("  %s order failed (attempt %d/3): %s", side_label, attempt, e)
+        if attempt < 3:
+            time.sleep(2)
+    log.error("  %s order failed after 3 attempts", side_label)
     return None
 
 
@@ -264,6 +268,7 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
 
     Uses the same limit-order path as the original placement but at
     the current market price rather than the fixed 0.45 entry price.
+    Retries up to 3 times with 2s delay (matches Rust bot retry logic).
     Returns order ID or None on failure.
     """
     from py_clob_client.order_builder.constants import BUY
@@ -277,17 +282,21 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
         side=BUY,
         expiration=expiration,
     )
-    try:
-        signed = client.create_order(order_args)
-        result = client.post_order(signed, OrderType.GTD)
-        oid = result.get("orderID", result.get("id", ""))
-        if oid:
-            log.info("  HEDGE %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
-            return oid
-        else:
-            log.warning("  HEDGE %s no order ID: %s", side_label, result)
-    except Exception as e:
-        log.error("  HEDGE %s order failed: %s", side_label, e)
+    for attempt in range(1, 4):
+        try:
+            signed = client.create_order(order_args)
+            result = client.post_order(signed, OrderType.GTD)
+            oid = result.get("orderID", result.get("id", ""))
+            if oid:
+                log.info("  HEDGE %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
+                return oid
+            else:
+                log.warning("  HEDGE %s no order ID: %s", side_label, result)
+        except Exception as e:
+            log.warning("  HEDGE %s order failed (attempt %d/3): %s", side_label, attempt, e)
+        if attempt < 3:
+            time.sleep(2)
+    log.error("  HEDGE %s order failed after 3 attempts", side_label)
     return None
 
 
@@ -413,9 +422,21 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         else:
             band = HEDGE_BAND_2MIN
 
-        # --- Step 5: Sell filled side if hedge becomes uneconomical (after 3min) ---
+        # --- Step 5: Valid-bounce check (Rust port) ---
+        # If trailing_min was deeply below the band (< band - delta), a bounce
+        # through the band is high-confidence — buy even if ask is now above band.
+        valid_bounce = trailing_min is not None and trailing_min < (band - HEDGE_TRAILING_DELTA)
+
+        # --- Step 5b: Sell filled side if hedge becomes uneconomical (after 3min) ---
         if hedge_ask >= band:
-            if time_elapsed >= HEDGE_3MIN_AFTER_S:
+            if valid_bounce:
+                log.info(
+                    "  HEDGE VALID-BOUNCE: %s ask=%.3f > band=%.2f "
+                    "but low=%.3f < band-delta — buying through band",
+                    hedge_side.upper(), hedge_ask, band, trailing_min,
+                )
+                # Fall through to Steps 6-7 below
+            elif time_elapsed >= HEDGE_3MIN_AFTER_S:
                 filled_bal = info.get("filled_bal", SHARES_PER_SIDE)
                 log.info(
                     "  HEDGE SELL-FILLED: %s ask=%.3f >= band=%.2f at %ds — "
@@ -427,12 +448,13 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
                 sell_at_bid(client, filled_token, filled_bal, filled_label)
                 info["hedge_done"] = True
                 info["bailed"] = True
+                continue
             else:
                 log.info(
                     "  HEDGE wait: %s ask=%.3f >= band=%.2f (elapsed=%ds)",
                     hedge_side.upper(), hedge_ask, band, time_elapsed,
                 )
-            continue
+                continue
 
         # --- Step 6: Dynamic bounce threshold — relax as time runs out ---
         # Starts at HEDGE_TRAILING_DELTA (0.03) at 120s, decays to ~0.01 at 240s
@@ -447,11 +469,22 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
             hedge_side.upper(), hedge_ask, trailing_min,
             bounce, min_bounce, time_elapsed, band,
         )
-        if bounce >= min_bounce:
+        triggered = bounce >= min_bounce or valid_bounce
+        if triggered:
             log.info(
-                "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f)",
+                "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f%s)",
                 hedge_side.upper(), trailing_min, hedge_ask, bounce, min_bounce,
+                ", valid-bounce" if valid_bounce else "",
             )
+            # --- Balance check before buy (prevents double-position) ---
+            current_bal = check_token_balance(client, hedge_token)
+            if current_bal >= SHARES_PER_SIDE - 0.01:
+                log.info(
+                    "  HEDGE skipped: already hold %.1f %s shares",
+                    current_bal, hedge_side.upper(),
+                )
+                info["hedge_done"] = True
+                continue
             buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
             info["hedge_done"] = True
 
