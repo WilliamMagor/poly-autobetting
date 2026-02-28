@@ -539,8 +539,15 @@ async def run():
         # Try redeeming resolved markets
         await try_redeem_all(client, relayer, past_markets)
 
-        # Wait and check for next market
-        await asyncio.sleep(10)  # 10s for faster WS-based bail detection
+        # Wait and check for next market (shorter interval for more responsive market detection)
+        await asyncio.sleep(5)
+
+        # Calculate time until next market
+        next_market_ts = (now // MARKET_PERIOD) * MARKET_PERIOD + MARKET_PERIOD
+        seconds_until = next_market_ts - now
+        
+        # Log status with countdown
+        log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
         # Clean very old entries (keep last 2 hours for redemption)
         past_markets = {ts: v for ts, v in past_markets.items() if ts > now - 7200}
