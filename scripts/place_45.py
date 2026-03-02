@@ -2024,6 +2024,43 @@ async def run():
                 past_markets[ts] = _market_entry(mkt, slug)
                 continue
 
+            # ── PRE-MARKET FAST PATH ────────────────────────────────────────
+            # Market hasn't started yet (secs_elapsed < 0). Skip all filters —
+            # vol/depth/blacklist conditions at T-120s are irrelevant to a market
+            # that starts in 2 minutes. Place both sides at PRICE immediately.
+            # If the CLOB rejects pre-market orders, don't mark as placed so we
+            # retry every tick until the market goes live.
+            if secs_elapsed < 0:
+                shares = session_stats["current_shares"]
+                log.info(
+                    "  PRE-MARKET: placing UP+DN for %s (%ds until start)",
+                    slug, -secs_elapsed,
+                )
+                up_id, dn_id = await asyncio.gather(
+                    asyncio.to_thread(place_order, client, mkt["up_token"], "UP  ", shares, PRICE),
+                    asyncio.to_thread(place_order, client, mkt["dn_token"], "DOWN", shares, PRICE),
+                )
+                placed = (1 if up_id else 0) + (1 if dn_id else 0)
+                if placed == 0:
+                    log.info("  PRE-MARKET: CLOB not accepting yet — retrying next tick")
+                    continue  # do NOT mark as placed
+                log_trade(
+                    "orders_placed", market_ts=ts, slug=slug,
+                    title=mkt.get("title", slug),
+                    up_price=PRICE, dn_price=PRICE, shares=shares,
+                    up_id=up_id, dn_id=dn_id, sides_placed=placed,
+                    elapsed_s=secs_elapsed,
+                )
+                session_stats["rounds"] = session_stats.get("rounds", 0) + 1
+                placed_markets.add(ts)
+                past_markets[ts] = _market_entry(
+                    mkt, slug, placed_at=ts,
+                    up_order_id=up_id, dn_order_id=dn_id,
+                    up_price=PRICE, dn_price=PRICE, shares=shares,
+                    btc_at_place=vol_cache.get("data", {}).get("last_price", 0),
+                )
+                continue
+
             # ── Max open markets cap ───────────────────────────────────────
             if MAX_OPEN_MARKETS > 0:
                 open_count = sum(1 for _ts, _info in past_markets.items() if not _info.get("redeemed"))
