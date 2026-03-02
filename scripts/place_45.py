@@ -127,6 +127,24 @@ BAIL_MIN_BID_DEPTH = float(os.getenv("PLACE_45_BAIL_MIN_DEPTH", "5.0"))
 # early realistically captures another dual-fill.  Makes bail more competitive vs hold.
 BAIL_CAPITAL_OPP = float(os.getenv("PLACE_45_BAIL_CAP_OPP", "0.40"))
 
+# --- Conviction add (increase exposure when holding to resolution) ---
+# After a one-sided fill where neither hedge nor bail fired, if BTC spot has moved
+# decisively in the direction of our held token AND Polymarket hasn't priced it in
+# yet, buy additional shares at market (taker) to increase directional exposure.
+# This exploits the typical 15-45s lag between BTC spot ticks and CLOB updates.
+CONV_ADD_ENABLED = os.getenv("PLACE_45_CONV_ADD", "1").strip().lower() in ("1", "true", "yes")
+# Only fire inside this time window before resolution (seconds remaining).
+CONV_ADD_MAX_S = int(os.getenv("PLACE_45_CONV_MAX_S", "90"))
+CONV_ADD_MIN_S = int(os.getenv("PLACE_45_CONV_MIN_S", "15"))
+# BTC must have moved at least this % from placement price in direction of held side.
+CONV_ADD_BTC_MOVE_PCT = float(os.getenv("PLACE_45_CONV_BTC_PCT", "0.25"))
+# Minimum gap between BTC-implied probability and current Polymarket ask (the edge).
+CONV_ADD_EDGE_MIN = float(os.getenv("PLACE_45_CONV_EDGE", "0.06"))
+# Hard cap on additional shares per conviction add (half-Kelly scaled, never above this).
+CONV_ADD_MAX_SHARES = int(os.getenv("PLACE_45_CONV_MAX_SHARES", "5"))
+# Don't add if session net P&L is already below this threshold (loss gate).
+CONV_ADD_MAX_LOSS = float(os.getenv("PLACE_45_CONV_MAX_LOSS", "15.0"))
+
 # --- Session risk ---
 SESSION_LOSS_LIMIT = float(os.getenv("PLACE_45_LOSS_LIMIT", "30.0"))
 # Reduced from 3 → 2: two consecutive bails signals a trending BTC regime where
@@ -1406,6 +1424,150 @@ async def try_merge_all(client, redeemer, past_markets: dict, session_stats: dic
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CONVICTION ADD — increase exposure when BTC spot leads Polymarket
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def check_conviction_add(
+    client,
+    ws_feed: "WSBookFeed",
+    past_markets: dict,
+    session_stats: dict,
+    vol_cache: dict,
+):
+    """Increase exposure on a one-sided hold when BTC spot has moved decisively
+    in the direction of our held token but Polymarket hasn't caught up yet.
+
+    Why this works: Polymarket's CLOB typically lags BTC spot by 15-45s because
+    limit-order LPs don't update quotes in real time.  When BTC has already moved
+    ≥ 0.25% from our placement price, the true win probability is higher than the
+    current ask implies.  We size into that gap with half-Kelly taker shares.
+
+    Conditions:
+      1. One-sided fill (hedge_side set), no hedge/bail/conv_add yet.
+      2. time_remaining in [CONV_ADD_MIN_S, CONV_ADD_MAX_S].
+      3. BTC moved ≥ CONV_ADD_BTC_MOVE_PCT in direction of held token,
+         measured from the BTC price at order placement.
+      4. Polymarket ask for held token < BTC-implied probability − CONV_ADD_EDGE_MIN.
+      5. Fee-adjusted EV of the add is positive.
+      6. Session net P&L not below −CONV_ADD_MAX_LOSS.
+    """
+    if not CONV_ADD_ENABLED:
+        return
+
+    now = int(time.time())
+    btc_data = vol_cache.get("data") or {}
+    btc_now = btc_data.get("last_price", 0)
+    if btc_now <= 0:
+        return
+
+    # Session loss gate
+    net_pnl = session_stats.get("total_return", 0) - session_stats.get("total_cost", 0)
+    if net_pnl < -CONV_ADD_MAX_LOSS:
+        return
+
+    for ts, info in list(past_markets.items()):
+        # Only for one-sided fills that are still open (no hedge/bail/prior add)
+        if not info.get("hedge_side"):
+            continue
+        if info.get("hedge_done") or info.get("bailed") or info.get("conv_added"):
+            continue
+        if info.get("redeemed") or info.get("closed") or info.get("compromised"):
+            continue
+
+        placed_at = info.get("placed_at", 0)
+        if not placed_at:
+            continue
+
+        time_elapsed = now - placed_at
+        time_remaining = max(0, MARKET_PERIOD - time_elapsed)
+
+        if time_remaining > CONV_ADD_MAX_S or time_remaining < CONV_ADD_MIN_S:
+            continue
+
+        # hedge_side = the UNFILLED side; filled side is the opposite
+        hedge_side = info["hedge_side"]          # "up" or "dn" (the side we need to complete)
+        filled_label = "UP" if hedge_side == "dn" else "DN"
+        up_token = info.get("up_token", "")
+        dn_token = info.get("dn_token", "")
+        filled_token = dn_token if hedge_side == "up" else up_token
+
+        # ── BTC directional check ───────────────────────────────────────────
+        btc_at_place = info.get("btc_at_place", 0)
+        if btc_at_place <= 0:
+            continue
+
+        btc_move_pct = ((btc_now - btc_at_place) / btc_at_place) * 100
+
+        if filled_label == "UP" and btc_move_pct < CONV_ADD_BTC_MOVE_PCT:
+            continue  # BTC hasn't moved enough upward
+        if filled_label == "DN" and btc_move_pct > -CONV_ADD_BTC_MOVE_PCT:
+            continue  # BTC hasn't moved enough downward
+
+        # ── Polymarket lag check ────────────────────────────────────────────
+        # Approximate BTC-implied probability from move magnitude.
+        # Linear: 0.25% → ~0.62, 0.50% → ~0.74, 1.0% → ~0.80.  Cap at 0.92.
+        abs_move = abs(btc_move_pct)
+        btc_implied_prob = min(0.92, 0.50 + min(0.42, abs_move * 0.48))
+
+        filled_ask = get_best_ask_safe(ws_feed, client, filled_token)
+        if filled_ask is None or filled_ask >= 0.95:
+            continue
+
+        edge = btc_implied_prob - filled_ask
+        if edge < CONV_ADD_EDGE_MIN:
+            log.debug(
+                "  CONV_ADD skip %s: edge=%.3f < min=%.3f "
+                "(ask=%.3f impl=%.3f move=%+.3f%%)",
+                filled_label, edge, CONV_ADD_EDGE_MIN,
+                filled_ask, btc_implied_prob, btc_move_pct,
+            )
+            continue
+
+        # ── Half-Kelly sizing ───────────────────────────────────────────────
+        # f* = (p - ask) / (1 - ask) for a binary win/loss bet.
+        # Use half-Kelly to account for model uncertainty.
+        kelly_full = edge / max(0.01, 1.0 - filled_ask)
+        base = info.get("shares", BASE_SHARES)
+        add_shares = max(1, min(CONV_ADD_MAX_SHARES, round(kelly_full * 0.5 * base)))
+
+        # ── EV check ───────────────────────────────────────────────────────
+        add_fee = polymarket_taker_fee(filled_ask, add_shares)
+        ev = (btc_implied_prob * add_shares) - (filled_ask * add_shares) - add_fee
+        if ev <= 0:
+            continue
+
+        log.info(
+            "  CONV_ADD TRIGGER: %s ask=%.3f btc_impl=%.3f edge=%.3f "
+            "btc_move=%+.3f%% add=%d shares EV=+$%.3f (%ds left)",
+            filled_label, filled_ask, btc_implied_prob, edge,
+            btc_move_pct, add_shares, ev, time_remaining,
+        )
+        log_trade(
+            "conviction_add_trigger", market_ts=ts, side=filled_label,
+            ask=round(filled_ask, 4), btc_implied=round(btc_implied_prob, 4),
+            edge=round(edge, 4), btc_move_pct=round(btc_move_pct, 3),
+            add_shares=add_shares, ev=round(ev, 4),
+            time_remaining=time_remaining,
+        )
+
+        oid = buy_hedge(client, filled_token, add_shares, f"{filled_label}+conv", filled_ask)
+        log_trade(
+            "conviction_add_placed", market_ts=ts, side=filled_label,
+            ask=round(filled_ask, 4), add_shares=add_shares,
+            order_id=oid, ev=round(ev, 4),
+        )
+
+        info["conv_added"] = True
+        info["conv_add_shares"] = add_shares
+        info["conv_add_price"] = filled_ask
+        session_stats["conv_adds"] = session_stats.get("conv_adds", 0) + 1
+        session_stats["total_cost"] = (
+            session_stats.get("total_cost", 0) + filled_ask * add_shares + add_fee
+        )
+        session_stats["total_fees"] = session_stats.get("total_fees", 0) + add_fee
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BACKGROUND LOOPS — hedge + order integrity
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1456,6 +1618,12 @@ async def run():
     log.info("  Vol filter: min=%.2f%% max=%.2f%%, min book depth=%.0f",
              VOL_MIN_ATR_PCT, VOL_MAX_ATR_PCT, MIN_BOOK_DEPTH)
     log.info("  Gas ceiling=%.0f gwei, on-chain verify=%s", GAS_CEILING_GWEI, ONCHAIN_VERIFY)
+    log.info(
+        "  Conviction add: %s  btc_move≥%.2f%%  edge≥%.2f  max_add=%d shares  window=%d-%ds",
+        "ON" if CONV_ADD_ENABLED else "OFF",
+        CONV_ADD_BTC_MOVE_PCT, CONV_ADD_EDGE_MIN,
+        CONV_ADD_MAX_SHARES, CONV_ADD_MIN_S, CONV_ADD_MAX_S,
+    )
     if redeemer:
         log.info("Auto-redeem enabled (on-chain via %s).\n", redeemer[1].address)
     else:
@@ -1475,6 +1643,7 @@ async def run():
         "dual_fills": 0,
         "hedged": 0,
         "bailed": 0,
+        "conv_adds": 0,
         "skipped_vol": 0,
         "skipped_depth": 0,
         "skipped_maker": 0,
@@ -1880,6 +2049,9 @@ async def run():
                 "up_price": up_price,
                 "dn_price": dn_price,
                 "shares": shares,
+                # BTC spot price at placement — used by conviction add to measure
+                # directional move before attempting to increase exposure.
+                "btc_at_place": vol_cache.get("data", {}).get("last_price", 0),
             }
 
         # ── Log WS prices for active markets ───────────────────────────────
@@ -1902,8 +2074,9 @@ async def run():
                     ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
                 )
 
-        # ── Bail, stale cancel, merge, redeem ──────────────────────────────
+        # ── Bail, conviction add, stale cancel, merge, redeem ──────────────
         await check_bail_out(client, ws_feed, past_markets, session_stats)
+        await check_conviction_add(client, ws_feed, past_markets, session_stats, vol_cache)
         await cancel_stale_orders(client, past_markets)
         await try_merge_all(client, redeemer, past_markets, session_stats)
         await try_redeem_all(client, redeemer, past_markets)
@@ -1913,7 +2086,7 @@ async def run():
             net = session_stats["total_return"] - session_stats["total_cost"]
             log.info(
                 "  ════ SESSION SUMMARY (after %d rounds) ════\n"
-                "    Dual fills: %d | Hedged: %d | Bailed: %d\n"
+                "    Dual fills: %d | Hedged: %d | Bailed: %d | Conv adds: %d\n"
                 "    Skipped (vol/depth/maker): %d/%d/%d\n"
                 "    Total cost: $%.2f | Total return: $%.2f\n"
                 "    Net P&L: $%.2f | Fees: $%.2f\n"
@@ -1922,6 +2095,7 @@ async def run():
                 session_stats.get("dual_fills", 0),
                 session_stats.get("hedged", 0),
                 session_stats.get("bailed", 0),
+                session_stats.get("conv_adds", 0),
                 session_stats.get("skipped_vol", 0),
                 session_stats.get("skipped_depth", 0),
                 session_stats.get("skipped_maker", 0),
@@ -1937,6 +2111,7 @@ async def run():
                 dual_fills=session_stats.get("dual_fills", 0),
                 hedged=session_stats.get("hedged", 0),
                 bailed=session_stats.get("bailed", 0),
+                conv_adds=session_stats.get("conv_adds", 0),
                 net_pnl=net, fees=session_stats.get("total_fees", 0),
             )
 
