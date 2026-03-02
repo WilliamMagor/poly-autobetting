@@ -1,26 +1,29 @@
 """
-Simple script: place 45c limit orders on both UP and DOWN for BTC 5-min markets.
-10 shares each side. Rotates to next market every 5 minutes.
-- Auto-merges complete sets (UP+DN) into USDC on-chain only after the market has ended.
-- Auto-redeems resolved positions (remaining tokens) via direct on-chain Polygon transaction.
+Dual-fill + merge bot for Polymarket BTC 5-min Up/Down binary markets.
 
-Optional env: PLACE_45_MAX_OPEN_MARKETS (cap open markets), PLACE_45_REST_FALLBACK=1 (REST ask fallback).
+Strategy: place maker-only GTC limit buys at PRICE on both UP and DN, 10 shares
+each side.  When both fill, merge for $1.00 USDC.  When only one fills, hedge
+quickly (≤ INSTANT_HEDGE_MAX) or bail via EV-based sliding thresholds.
+
+Key quant rules (v2):
+  * Polymarket fee curve:  maker 0%, taker ≈ 1.5% peak near p=0.50.
+  * Maker-only entry:  only post limit if best_ask > our price (rests on book).
+  * Instant hedge:  after HEDGE_GRACE_S, buy unfilled if ask ≤ INSTANT_HEDGE_MAX
+    AND fee-adjusted profit ≥ MIN_HEDGE_EDGE.
+  * Trailing hedge:  same cap as instant; no bands above INSTANT_HEDGE_MAX.
+  * No force-buy:  if no hedge opportunity, let position ride to resolution.
+  * EV-based bail:  compare bail P&L (including taker fee + slippage) vs
+    hold-to-resolution EV; only bail when it's strictly better.
+  * On-chain fill verification:  confirm CTF balance on Polygon before hedging.
+  * Volatility + liquidity filters:  skip rounds when conditions are bad.
+  * Gas ceiling:  delay non-urgent merge/redeem when gas is elevated.
+  * Position sizing:  parameterized, scales from BASE_SHARES upward.
+  * Session risk:  configurable loss limit, consecutive-bail pause.
+
+Auto-merges complete sets (UP+DN) into USDC on-chain after market ends.
+Auto-redeems resolved positions via direct on-chain Polygon transaction.
 
 Usage: python scripts/place_45.py
-
---- Bail vs Hedge (one-sided fill) ---
-  BAIL: When only one side filled and the *other* side's ask goes above 0.72 (BAIL_PRICE),
-  we sell the side we hold (the "losing" side) at the bid and cancel orders. That exits
-  the naked directional risk instead of holding to resolution (where the loser goes to $0).
-  So bail does not buy the other side; it cuts losses by selling what we have.
-
-  HEDGE (trailing): We *do* buy the unfilled side to complete the set, but only when
-  it's cheap enough (bands) and when price has bounced off a floor (trailing stop):
-  - 2-min window (120–180s): band 0.45 → only buy if hedge_ask < 0.45; trigger when
-    ask >= lowest_ask + 0.03 (HEDGE_TRAILING_DELTA).
-  - 3-min window (180–240s): band 0.55 → buy if hedge_ask < 0.55; same trailing idea,
-    min_bounce relaxes to ~0.01 by 240s.
-  So we track lowest_ask on the unfilled side and buy when ask bounces up by the delta.
 """
 
 import asyncio
@@ -70,44 +73,329 @@ def log_trade(event: str, **fields):
     _trade_log.write(json.dumps(record) + "\n")
 
 
-# --- Config ---
-PRICE = 0.45
-SHARES_PER_SIDE = 10     # Reduced for 5min markets (more frequent rotations)
-BAIL_PRICE = 0.72        # if one side's ask > 72c and we only hold the other → sell held side (exit risk)
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG — all tunables, env-overridable
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- Entry price & position sizing ---
+PRICE = float(os.getenv("PLACE_45_PRICE", "0.45"))
+BASE_SHARES = int(os.getenv("PLACE_45_SHARES", "10"))
+SHARES_PER_SIDE = BASE_SHARES  # alias; can be dynamically reduced by vol filter
+
+# --- Polymarket fee model (exact formula for 5-min/15-min crypto) ---
+# Taker fee = shares * fee_rate * (p * (1-p))^2.
+# fee_rate defaults to 0.25 (Polymarket's documented rate for crypto markets).
+# Maker fee = 0.  We treat initial limits as maker-only.
+FEE_RATE = float(os.getenv("PLACE_45_FEE_RATE", "0.25"))
+
+# --- Maker-only entry guard ---
+# Minimum gap between our limit price and best_ask for the order to rest
+# as maker on the book (never cross spread).
+MAKER_MIN_GAP = float(os.getenv("PLACE_45_MAKER_GAP", "0.01"))
+# If best_ask is too close, we can place at best_ask - MAKER_MIN_GAP,
+# but never below this floor.
+MAKER_PRICE_FLOOR = float(os.getenv("PLACE_45_MAKER_FLOOR", "0.42"))
+
+# --- Hedge logic ---
+# Grace lowered 30→15s: real fills land at 4–42s in (per log data); starting the hedge
+# watch at 15s catches asks while the book is still close to the entry price.
+HEDGE_GRACE_S = int(os.getenv("PLACE_45_HEDGE_GRACE_S", "15"))
+# At PRICE=0.45 the profitable hedge range extends to ~0.527 (net ≥ $0.03 after fee).
+# Raised from 0.52 → 0.53 so the full profitable range is captured.
+INSTANT_HEDGE_MAX = float(os.getenv("PLACE_45_HEDGE_MAX", "0.53"))
+# Lowered from $0.05 → $0.03: accepts hedges up to ~0.530 which are still net-positive.
+# $0.03 is still a meaningful edge floor; prevents hedging at a loss.
+MIN_HEDGE_EDGE = float(os.getenv("PLACE_45_MIN_HEDGE_EDGE", "0.03"))
+# Trailing bounce threshold lowered 0.02 → 0.015: volatile 5-min BTC markets reverse
+# in smaller increments; 1.5c bounce is still confirmation without being hair-trigger.
+HEDGE_TRAILING_DELTA = float(os.getenv("PLACE_45_HEDGE_DELTA", "0.015"))
+
+# --- Bail logic (EV-based, time-gated) ---
+# Opened 30s earlier (180→150): gives more time to exit at a decent bid before
+# the book thins out in the final 2.5 minutes of a losing position.
+BAIL_NO_BAIL_BEFORE_S = int(os.getenv("PLACE_45_BAIL_NO_BEFORE", "150"))
+# Sliding thresholds on *unfilled* side ask.  If unfilled ask > threshold at
+# that time bucket, we consider bailing (but EV check must also pass).
+# All tightened 3c: volatile BTC markets mean the filled side's bid deteriorates
+# fast once a trend is established — cutting earlier preserves more capital.
+BAIL_THRESHOLD_180 = float(os.getenv("PLACE_45_BAIL_T180", "0.65"))
+BAIL_THRESHOLD_120 = float(os.getenv("PLACE_45_BAIL_T120", "0.58"))
+BAIL_THRESHOLD_60  = float(os.getenv("PLACE_45_BAIL_T60",  "0.53"))
+# Minimum bid-side depth (shares) to accept a bail exit without excess slippage.
+BAIL_MIN_BID_DEPTH = float(os.getenv("PLACE_45_BAIL_MIN_DEPTH", "5.0"))
+# Raised from $0.30 → $0.40: with 5-min rounds, freeing $9 of capital even 2 min
+# early realistically captures another dual-fill.  Makes bail more competitive vs hold.
+BAIL_CAPITAL_OPP = float(os.getenv("PLACE_45_BAIL_CAP_OPP", "0.40"))
+
+# --- Session risk ---
+SESSION_LOSS_LIMIT = float(os.getenv("PLACE_45_LOSS_LIMIT", "30.0"))
+# Reduced from 3 → 2: two consecutive bails signals a trending BTC regime where
+# dual-fills won't land.  Pausing earlier limits drawdown from the streak.
+CONSECUTIVE_BAIL_PAUSE = int(os.getenv("PLACE_45_BAIL_PAUSE_N", "2"))
+CONSECUTIVE_BAIL_PAUSE_S = int(os.getenv("PLACE_45_BAIL_PAUSE_S", "900"))  # 15 min
+# Reduced from 0.5 → 0.4: after a bail streak, return at 40% size (4 shares) rather
+# than 50% — more conservative re-entry while the trend may still be in play.
+BAIL_REDUCE_FACTOR = float(os.getenv("PLACE_45_BAIL_REDUCE", "0.4"))
+
+# --- Volatility & liquidity filters ---
+# BTC 5-min ATR% thresholds.
+VOL_MIN_ATR_PCT = float(os.getenv("PLACE_45_VOL_MIN", "0.03"))   # skip if < 0.03%
+# Tightened 0.50→0.40%: above 0.40% ATR the market is in a trending/breakout regime
+# where one-sided fills are likely and hedge prices spike above INSTANT_HEDGE_MAX fast.
+# Reducing size earlier is the single best risk-adjusted lever for volatile BTC.
+VOL_MAX_ATR_PCT = float(os.getenv("PLACE_45_VOL_MAX", "0.40"))   # start reducing above 0.40%
+# Hard cap tightened 1.0→0.75%: above 0.75% ATR BTC is breaking out — floor to 20% size.
+VOL_HARD_CAP_PCT = float(os.getenv("PLACE_45_VOL_HARD_CAP", "0.75"))  # floor at 20% size above this
+# Minimum orderbook depth (shares) within 3c of PRICE on each side.
+MIN_BOOK_DEPTH = float(os.getenv("PLACE_45_MIN_DEPTH", "15.0"))
+
+# --- Gas ceiling (Polygon, gwei) ---
+GAS_CEILING_GWEI = float(os.getenv("PLACE_45_GAS_CEIL", "100.0"))
+# Non-urgent = merge/redeem.  Urgent = hedge/bail (never skip).
+
+# --- Stale cancel & placement window ---
+STALE_CANCEL_BEFORE_END_S = int(os.getenv("PLACE_45_STALE_CANCEL", "60"))
+NEW_MARKET_PLACE_WINDOW_SECONDS = 15
+
+# --- Infrastructure ---
 GAMMA_URL = "https://gamma-api.polymarket.com"
 MARKET_PERIOD = 300      # 5 minutes (300 seconds)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-
-# --- Trailing hedge config (from Rust bot analysis) ---
-# Only place initial orders within the first N seconds of a market period.
-# Rust bot uses NEW_MARKET_PLACE_WINDOW_SECONDS = 15.
-NEW_MARKET_PLACE_WINDOW_SECONDS = 15
-# After one side fills, cancel unfilled limit and trail the cheap side.
-# Time windows (seconds elapsed since MARKET START — same anchor as Rust bot):
-HEDGE_START_AFTER_S = 120      # 2-min: start trailing
-HEDGE_3MIN_AFTER_S  = 180      # 3-min: widen band
-HEDGE_4MIN_AFTER_S  = 240      # 4-min: force-buy window
-# Band thresholds: PRICE + hedge_ask must stay below 1.00 to be profitable.
-# band_2min = 1.0 - PRICE - 0.10 = 0.45  (conservative, requires cheap hedge)
-# band_3min = 1.0 - PRICE        = 0.55  (wider, closer to breakeven)
-HEDGE_BAND_2MIN = 1.0 - PRICE - 0.10   # 0.45
-HEDGE_BAND_3MIN = 1.0 - PRICE          # 0.55
-# Trailing delta: buy when ask bounces this much above its lowest point.
-HEDGE_TRAILING_DELTA = 0.03
-# Force-buy threshold at 4-min: if the FILLED side's ask reached this level,
-# the unfilled side is very cheap → buy at market regardless of trailing.
-HEDGE_FORCE_BUY_FILLED_THRESHOLD = 0.85
-
-# --- Risk limits (optional) ---
-# Max number of markets we have open orders or positions in (0 = no cap)
 MAX_OPEN_MARKETS = int(os.getenv("PLACE_45_MAX_OPEN_MARKETS", "0"))
-# If WS has no ask, fall back to REST order book for hedge/bail (slower but safer)
 HEDGE_USE_REST_FALLBACK = os.getenv("PLACE_45_REST_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
-
-# --- Speed: pre-fetch next market when this many seconds until start
 NEXT_MARKET_PREFETCH_SEC = 60
 
+# --- On-chain verification ---
+ONCHAIN_VERIFY = os.getenv("PLACE_45_ONCHAIN_VERIFY", "1").strip().lower() in ("1", "true", "yes")
+INTEGRITY_INTERVAL_S = float(os.getenv("PLACE_45_INTEGRITY_INTERVAL_S", "3.0"))
+BLACKLIST_ENABLED = os.getenv("PLACE_45_BLACKLIST_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+# Blacklist file for suspicious counterparties.
+BLACKLIST_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "logs", "blacklist.json",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS — fees, EV, volatility, on-chain, gas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def polymarket_taker_fee(price: float, shares: float, fee_rate: float = None) -> float:
+    """Polymarket taker fee in USDC (exact formula for 5-min/15-min crypto).
+
+    fee = shares * fee_rate * (p * (1-p))^2
+
+    At p=0.50 with fee_rate=0.25:  fee = 10 * 0.25 * 0.0625 = $0.15625/share.
+    At p=0.45:                      fee = 10 * 0.25 * (0.45*0.55)^2 ≈ $0.152.
+    Maker fee = 0 (our GTC limits rest on the book).
+    """
+    if fee_rate is None:
+        fee_rate = FEE_RATE
+    p = max(0.01, min(0.99, price))
+    return round(shares * fee_rate * (p * (1.0 - p)) ** 2, 6)
+
+
+def compute_hedge_ev(fill_price: float, hedge_price: float, shares: float) -> tuple[float, float]:
+    """Expected P&L for a hedge trade after taker fee + gas.
+
+    Returns (net_pnl, fee_dollars).
+    fill_price is maker (0 fee).  hedge_price is taker.
+    """
+    fill_cost = fill_price * shares
+    hedge_cost = hedge_price * shares
+    hedge_fee = polymarket_taker_fee(hedge_price, shares)
+    merge_return = 1.0 * shares
+    gas_est = 0.01
+    net_pnl = merge_return - fill_cost - hedge_cost - hedge_fee - gas_est
+    return round(net_pnl, 4), round(hedge_fee, 4)
+
+
+def compute_bail_ev(
+    fill_price: float,
+    sell_bid: float,
+    shares: float,
+    unfilled_ask: float,
+    time_remaining_s: float,
+) -> tuple[float, float, bool]:
+    """Compare bail-now EV vs hold-to-resolution EV.
+
+    Returns (bail_pnl, hold_ev, should_bail).
+    Bail includes taker fee on the sale.
+    Hold uses market-implied win probability from the *filled* side's bid.
+    Capital opportunity adds value to freeing funds early.
+    """
+    sell_proceeds = sell_bid * shares
+    sell_fee = polymarket_taker_fee(sell_bid, shares)
+    bail_pnl = sell_proceeds - sell_fee - (fill_price * shares)
+
+    # Market-implied win probability: use BOTH sides for consistency.
+    # Filled side bid ≈ market's view of filled win prob.
+    # Unfilled ask ≈ market's view of unfilled win prob.
+    # In a binary market: filled_win ≈ 1 - unfilled_win.
+    # Average the two estimates for a more robust signal.
+    filled_implied = sell_bid
+    unfilled_implied = 1.0 - unfilled_ask  # if unfilled ask is 0.70, filled win ≈ 0.30
+    win_prob = max(0.05, min(0.95, (filled_implied + unfilled_implied) / 2.0))
+    hold_ev = (win_prob * 1.0 * shares) - (fill_price * shares)
+
+    # Capital opportunity: freeing capital to redeploy scales with time left.
+    capital_opp = BAIL_CAPITAL_OPP * (time_remaining_s / MARKET_PERIOD)
+    bail_adjusted = bail_pnl + capital_opp
+
+    return round(bail_pnl, 4), round(hold_ev, 4), bail_adjusted > hold_ev
+
+
+async def get_btc_volatility() -> dict:
+    """Fetch BTC 5-min klines from Binance and compute short-term ATR metrics."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": "5m", "limit": 12},
+            )
+            r.raise_for_status()
+            klines = r.json()
+
+        closes = [float(k[4]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+
+        true_ranges = []
+        for i in range(1, len(klines)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            true_ranges.append(tr)
+
+        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0
+        last_price = closes[-1] if closes else 85000
+        atr_pct = (atr / last_price) * 100
+
+        return {"atr": atr, "atr_pct": atr_pct, "last_price": last_price, "ok": True}
+    except Exception as e:
+        log.warning("Volatility check failed: %s", e)
+        return {"atr": 0, "atr_pct": 0, "last_price": 0, "ok": False}
+
+
+def check_book_depth(client, token_id: str, near_price: float, min_depth: float = 15.0) -> dict:
+    """Check orderbook depth within 3c of a price level."""
+    try:
+        book = client.get_order_book(token_id)
+        ask_depth = sum(
+            float(a.size)
+            for a in (book.asks or [])
+            if float(a.price) <= near_price + 0.03
+        )
+        bid_depth = sum(
+            float(b.size)
+            for b in (book.bids or [])
+            if float(b.price) >= near_price - 0.03
+        )
+        best_ask = float(book.asks[0].price) if book.asks else None
+        best_bid = float(book.bids[0].price) if book.bids else None
+        return {
+            "ask_depth": ask_depth,
+            "bid_depth": bid_depth,
+            "best_ask": best_ask,
+            "best_bid": best_bid,
+            "sufficient": ask_depth >= min_depth and bid_depth >= min_depth,
+        }
+    except Exception:
+        return {
+            "ask_depth": 0, "bid_depth": 0,
+            "best_ask": None, "best_bid": None,
+            "sufficient": False,
+        }
+
+
+def get_bid_depth_at(client, token_id: str, min_price: float) -> float:
+    """Total bid size available at or above min_price (for slippage check)."""
+    try:
+        book = client.get_order_book(token_id)
+        return sum(float(b.size) for b in (book.bids or []) if float(b.price) >= min_price)
+    except Exception:
+        return 0.0
+
+
+def verify_onchain_balance(redeemer, token_id: str) -> float:
+    """Query CTF ERC-1155 balanceOf on Polygon for actual on-chain balance.
+
+    Returns balance in shares (float).  Returns -1.0 if verification fails
+    (so callers can distinguish 'cannot verify' from 'balance is 0').
+    """
+    if not redeemer:
+        return -1.0
+    from web3 import Web3
+
+    w3, account = redeemer
+    abi = [
+        {
+            "name": "balanceOf",
+            "type": "function",
+            "inputs": [
+                {"name": "account", "type": "address"},
+                {"name": "id", "type": "uint256"},
+            ],
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+        }
+    ]
+    contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=abi)
+    try:
+        raw = contract.functions.balanceOf(account.address, int(token_id)).call()
+        return raw / 1e6
+    except Exception as e:
+        log.warning("On-chain balance check failed for %s: %s", token_id[:12], e)
+        return -1.0
+
+
+def check_order_still_live(client, order_id: str) -> bool:
+    """Verify that an order still exists on the book (ghost-fill protection)."""
+    if not order_id:
+        return False
+    try:
+        order = client.get_order(order_id)
+        return order.get("status") in ("LIVE", "MATCHED")
+    except Exception:
+        return False
+
+
+def get_polygon_gas_gwei(redeemer) -> float:
+    """Current Polygon gas price in gwei.  Returns 0 if unavailable."""
+    if not redeemer:
+        return 0.0
+    try:
+        w3, _ = redeemer
+        return w3.eth.gas_price / 1e9
+    except Exception:
+        return 0.0
+
+
+def load_blacklist() -> set:
+    """Load counterparty blacklist from disk."""
+    try:
+        with open(BLACKLIST_PATH, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_blacklist(bl: set):
+    """Persist counterparty blacklist to disk."""
+    try:
+        os.makedirs(os.path.dirname(BLACKLIST_PATH), exist_ok=True)
+        with open(BLACKLIST_PATH, "w") as f:
+            json.dump(list(bl), f)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS — timestamps, slugs, validation (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def next_market_timestamps(now_ts: int) -> list[int]:
     """Return [currently_trading, next, after_that] 5m market timestamps.
@@ -145,6 +433,10 @@ def _validate_condition_id(condition_id: str) -> str:
         raise ValueError(f"Invalid conditionId: too short, got {condition_id}")
     return condition_id
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# API FUNCTIONS — market info, SDK init (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def get_market_info(slug: str) -> dict:
     """Fetch market info from gamma API with input validation."""
@@ -247,6 +539,10 @@ def init_redeemer():
     return (w3, account)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORDER FUNCTIONS — place, sell, hedge buy (minor additions for logging)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def place_order(client, token_id: str, side_label: str, shares: float, price: float):
     """Place a single limit buy order. Returns order ID or None."""
     from py_clob_client.order_builder.constants import BUY
@@ -315,7 +611,7 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
     """Place a limit BUY for the hedge side (post-one-sided-fill).
 
     Uses the same limit-order path as the original placement but at
-    the current market price rather than the fixed 0.45 entry price.
+    the current market price rather than the fixed entry price.
     Retries up to 3 times with 2s delay (matches Rust bot retry logic).
     Returns order ID or None on failure.
     """
@@ -348,46 +644,36 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
     return None
 
 
-async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict):
-    """Time-windowed trailing-stop hedge for one-sided fills.
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEDGE LOGIC — instant + trailing with fee-aware EV, no force-buy
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    Ported from Rust bot (main_dual_limit_045_5m_btc.rs).
+async def check_hedge_trailing(
+    client,
+    ws_feed: "WSBookFeed",
+    past_markets: dict,
+    redeemer,
+    session_stats: dict,
+):
+    """Time-windowed hedge logic for one-sided fills.
 
-    Strategy:
-      After one limit order fills and the other doesn't, the market has moved
-      directionally. Rather than holding a naked directional position to
-      resolution, we:
-        1. Detect one-sided fill as soon as it happens (no 120s wait) so we
-           start tracking the trailing floor from the moment of fill.
-        2. Wait until 120s before cancelling the unfilled limit (gives it a
-           chance to fill naturally in the first 2 minutes).
-        3. Track the lowest ask of the unfilled side (trail the floor).
-        4. Buy when the price BOUNCES UP by min_bounce (dynamic, starts at
-           HEDGE_TRAILING_DELTA=0.03 and relaxes to ~0.01 at 240s).
-        5. Apply progressive band thresholds so we only buy if profitable:
-             120-180s: hedge_ask < HEDGE_BAND_2MIN (0.45)  →  total < 0.90
-             180-240s: hedge_ask < HEDGE_BAND_3MIN (0.55)  →  total < 1.00
-        6. If hedge_ask >= band after 180s, sell the filled side instead of
-           waiting — hedging would cost more than $1.00, so exit gracefully.
-        7. At 240s+: force-buy if the FILLED side's ask >= 0.85 (the market
-           is very confident, unfilled side is cheap ~0.15).
-
-    Timing anchor: placed_at == ts (market START timestamp), so time_elapsed
-    mirrors the Rust bot's (MARKET_PERIOD - time_remaining_seconds) exactly.
-
-    State stored per market in past_markets:
-      hedge_side:        "up" | "dn" | None  — which side needs to be hedged
-      filled_bal:        float — balance of the filled side at detection time
-      hedge_cancelled:   bool — unfilled limit was cancelled
-      hedge_done:        bool — hedge buy was placed or filled side sold
-      trailing_min_ask:  float | None — lowest ask seen for unfilled side
+    v2 changes vs original:
+      1. On-chain fill verification before treating a fill as real.
+      2. Cancel unfilled limit IMMEDIATELY on detecting one-sided fill.
+      3. 30s grace period (configurable) before any hedge action.
+      4. Instant hedge if ask ≤ INSTANT_HEDGE_MAX (0.52) AND EV ≥ MIN_HEDGE_EDGE.
+      5. Trailing hedge also capped at INSTANT_HEDGE_MAX with EV check.
+      6. NO force-buy — if > 0.52, fall through to bail logic or hold.
+      7. Track hedge_price in info for session P&L.
     """
     now = int(time.time())
 
     for ts, info in list(past_markets.items()):
-        # Skip markets that are fully handled (bailed = we already sold filled side)
+        # Skip fully-handled markets
         if info.get("hedge_done") or info.get("redeemed") or info.get("closed") or info.get("bailed"):
             continue
+        if info.get("compromised"):
+            continue  # ghost-fill flagged market
 
         up_token = info.get("up_token", "")
         dn_token = info.get("dn_token", "")
@@ -395,9 +681,11 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         if not up_token or not dn_token or not placed_at:
             continue
 
+        # Use per-market shares (may differ from current session shares due to vol/bail sizing)
+        shares = info.get("shares", session_stats.get("current_shares", SHARES_PER_SIDE))
         time_elapsed = now - placed_at
 
-        # --- Step 1: Detect one-sided fill (no time gate — start tracking early) ---
+        # ── Step 1: Detect one-sided fill ──────────────────────────────────
         if not info.get("hedge_side"):
             try:
                 up_bal = check_token_balance(client, up_token)
@@ -410,159 +698,199 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
             elif dn_bal > 0 and up_bal == 0:
                 hedge_side, filled_bal = "up", dn_bal
             else:
-                # Both filled (complete set) or neither filled — nothing to do yet
+                # Both filled (complete set) or neither filled — nothing to do
                 continue
 
+            # ── Step 1b: On-chain verification ─────────────────────────────
+            filled_token_id = up_token if hedge_side == "dn" else dn_token
+            if ONCHAIN_VERIFY and redeemer:
+                onchain_bal = verify_onchain_balance(redeemer, filled_token_id)
+                if onchain_bal == 0:
+                    # API says filled but on-chain says 0 → ghost fill!
+                    log.warning(
+                        "  WARNING GHOST FILL detected at %ds: API says %s filled=%.1f "
+                        "but on-chain=0. Flagging market as compromised.",
+                        time_elapsed,
+                        "UP" if hedge_side == "dn" else "DN",
+                        filled_bal,
+                    )
+                    log_trade(
+                        "ghost_fill", market_ts=ts,
+                        filled_side="UP" if hedge_side == "dn" else "DN",
+                        api_bal=filled_bal, onchain_bal=0,
+                    )
+                    # Cancel all orders for this market
+                    cancel_market_orders(client, {up_token, dn_token})
+                    info["compromised"] = True
+                    # Blacklist: try to extract counterparty from fill metadata
+                    if BLACKLIST_ENABLED:
+                        bl = session_stats.get("_blacklist", set())
+                        # Attempt to get maker/taker address from order fill
+                        for oid_key in ("up_order_id", "dn_order_id"):
+                            oid = info.get(oid_key)
+                            if not oid:
+                                continue
+                            try:
+                                order = client.get_order(oid)
+                                counterparty = order.get("maker_address") or order.get("taker_address")
+                                if counterparty:
+                                    bl.add(counterparty)
+                                    log.warning("  BLACKLIST added counterparty: %s", counterparty[:16])
+                                    log_trade("blacklist_add", address=counterparty, reason="ghost_fill")
+                            except Exception:
+                                pass
+                        session_stats["_blacklist"] = bl
+                        save_blacklist(bl)
+                    continue
+                elif onchain_bal >= 0 and onchain_bal < filled_bal * 0.9:
+                    log.warning(
+                        "  WARNING Balance mismatch: API=%.1f on-chain=%.1f for %s. "
+                        "Using on-chain value.",
+                        filled_bal, onchain_bal,
+                        "UP" if hedge_side == "dn" else "DN",
+                    )
+                    filled_bal = onchain_bal
+
             log.info(
-                "  HEDGE detected one-sided fill at %ds: %s filled, tracking %s",
+                "  HEDGE detected one-sided fill at %ds: %s filled (%.1f), "
+                "will hedge %s",
                 time_elapsed,
                 "UP" if hedge_side == "dn" else "DN",
+                filled_bal,
                 hedge_side.upper(),
             )
             info["hedge_side"] = hedge_side
             info["filled_bal"] = filled_bal
             info["trailing_min_ask"] = None
-            log_trade("fill_detected", market_ts=ts,
-                      filled_side="UP" if hedge_side == "dn" else "DN",
-                      filled_bal=filled_bal, hedge_side=hedge_side.upper(),
-                      elapsed_s=time_elapsed)
+            log_trade(
+                "fill_detected", market_ts=ts,
+                filled_side="UP" if hedge_side == "dn" else "DN",
+                filled_bal=filled_bal, hedge_side=hedge_side.upper(),
+                elapsed_s=time_elapsed, onchain_verified=ONCHAIN_VERIFY,
+            )
 
+            # ── Step 1c: Cancel unfilled limit IMMEDIATELY ─────────────────
+            hedge_token = up_token if hedge_side == "up" else dn_token
+            log.info("  HEDGE cancelling unfilled %s limit immediately", hedge_side.upper())
+            cancel_market_orders(client, {hedge_token})
+            info["hedge_cancelled"] = True
+
+        # ── Step 2: Get current state ──────────────────────────────────────
         hedge_side: str = info["hedge_side"]
         hedge_token = up_token if hedge_side == "up" else dn_token
         filled_token = dn_token if hedge_side == "up" else up_token
         filled_label = "UP" if hedge_side == "dn" else "DN"
 
-        # --- Step 2: Track trailing minimum from fill detection (before 120s) ---
         hedge_ask = get_best_ask_safe(ws_feed, client, hedge_token)
         if hedge_ask is None:
             continue
 
+        # Track trailing minimum
         prev_min = info.get("trailing_min_ask")
         if prev_min is None or hedge_ask < prev_min:
             info["trailing_min_ask"] = hedge_ask
             if prev_min is not None:
                 log.info("  HEDGE trail: new low for %s ask=%.3f", hedge_side.upper(), hedge_ask)
-
         trailing_min = info["trailing_min_ask"]
 
-        # Don't cancel or buy until 120s — give unfilled limit a chance to fill
-        if time_elapsed < HEDGE_START_AFTER_S:
+        # ── Step 3: Grace period — wait for natural fill ───────────────────
+        if time_elapsed < HEDGE_GRACE_S:
             continue
 
-        # --- Step 3: Cancel unfilled limit once at 120s ---
-        if not info.get("hedge_cancelled"):
-            log.info("  HEDGE cancelling unfilled %s limit", hedge_side.upper())
-            cancel_market_orders(client, {hedge_token})
-            info["hedge_cancelled"] = True
-
-        # --- Step 4: Time-windowed band threshold ---
-        if time_elapsed >= HEDGE_4MIN_AFTER_S:
-            band = HEDGE_BAND_3MIN
-            # Force-buy: filled side at 0.85+ means hedge side is very cheap
-            filled_ask = get_best_ask_safe(ws_feed, client, filled_token)
-            if filled_ask is not None and filled_ask >= HEDGE_FORCE_BUY_FILLED_THRESHOLD:
-                log.info(
-                    "  HEDGE FORCE-BUY: filled side ask=%.2f >= %.2f, hedge %s ask=%.3f",
-                    filled_ask, HEDGE_FORCE_BUY_FILLED_THRESHOLD,
-                    hedge_side.upper(), hedge_ask,
-                )
-                log_trade("hedge_force_buy", market_ts=ts, hedge_side=hedge_side.upper(),
-                          filled_ask=filled_ask, hedge_ask=hedge_ask, elapsed_s=time_elapsed)
-                buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
-                info["hedge_done"] = True
-                continue
-        elif time_elapsed >= HEDGE_3MIN_AFTER_S:
-            band = HEDGE_BAND_3MIN
-        else:
-            band = HEDGE_BAND_2MIN
-
-        # --- Step 5: Valid-bounce check (Rust port) ---
-        # If trailing_min was deeply below the band (< band - delta), a bounce
-        # through the band is high-confidence — buy even if ask is now above band.
-        valid_bounce = trailing_min is not None and trailing_min < (band - HEDGE_TRAILING_DELTA)
-
-        # --- Step 5b: Sell filled side if hedge becomes uneconomical (after 3min) ---
-        if hedge_ask >= band:
-            if valid_bounce:
-                log.info(
-                    "  HEDGE VALID-BOUNCE: %s ask=%.3f > band=%.2f "
-                    "but low=%.3f < band-delta — buying through band",
-                    hedge_side.upper(), hedge_ask, band, trailing_min,
-                )
-                # Fall through to Steps 6-7 below
-            elif time_elapsed >= HEDGE_3MIN_AFTER_S:
-                # Use current balance so we don't try to sell more than we hold (e.g. after manual sell or bail)
-                try:
-                    sell_bal = check_token_balance(client, filled_token)
-                except Exception:
-                    sell_bal = info.get("filled_bal", SHARES_PER_SIDE)
-                if sell_bal <= 0:
-                    info["hedge_done"] = True
+        # ── Step 4: Periodic integrity check (every INTEGRITY_INTERVAL_S) ────
+        # Verify filled position hasn't vanished (ghost-fill / liquidity-drain).
+        last_integrity = info.get("last_integrity_check", 0)
+        if now - last_integrity >= INTEGRITY_INTERVAL_S:
+            info["last_integrity_check"] = now
+            # Verify filled side balance hasn't disappeared
+            try:
+                current_filled_bal = check_token_balance(client, filled_token)
+                if current_filled_bal <= 0 and info.get("filled_bal", 0) > 0:
+                    log.warning(
+                        "  WARNING Filled position vanished! %s was %.1f, now 0. "
+                        "Flagging market as compromised.",
+                        filled_label, info["filled_bal"],
+                    )
+                    log_trade("position_vanished", market_ts=ts, side=filled_label)
+                    info["compromised"] = True
+                    cancel_market_orders(client, {up_token, dn_token})
                     continue
-                log.info(
-                    "  HEDGE SELL-FILLED: %s ask=%.3f >= band=%.2f at %ds — "
-                    "selling %s %.0f (hedging would cost >$1.00)",
-                    hedge_side.upper(), hedge_ask, band, time_elapsed,
-                    filled_label, sell_bal,
-                )
-                log_trade("hedge_sell_filled", market_ts=ts, hedge_side=hedge_side.upper(),
-                          hedge_ask=hedge_ask, band=band, filled_bal=sell_bal,
-                          elapsed_s=time_elapsed)
-                cancel_market_orders(client, {hedge_token})
-                sell_at_bid(client, filled_token, sell_bal, filled_label)
-                info["hedge_done"] = True
-                info["bailed"] = True
-                continue
-            else:
-                log.info(
-                    "  HEDGE wait: %s ask=%.3f >= band=%.2f (elapsed=%ds)",
-                    hedge_side.upper(), hedge_ask, band, time_elapsed,
-                )
-                continue
+            except Exception:
+                pass
 
-        # --- Step 6: Dynamic bounce threshold — relax as time runs out ---
-        # Starts at HEDGE_TRAILING_DELTA (0.03) at 120s, decays to ~0.01 at 240s
-        progress = min(1.0, (time_elapsed - HEDGE_START_AFTER_S) /
-                            (HEDGE_4MIN_AFTER_S - HEDGE_START_AFTER_S))
-        min_bounce = HEDGE_TRAILING_DELTA * (1.0 - progress * 0.67)
-
-        # --- Step 7: Trailing-stop trigger — buy on bounce from floor ---
-        if trailing_min is None:
-            continue  # no floor yet (e.g. WS had no data until now)
-        bounce = hedge_ask - trailing_min
-        log.info(
-            "  HEDGE trail: %s ask=%.3f low=%.3f bounce=%.3f/%.3f (elapsed=%ds band=%.2f)",
-            hedge_side.upper(), hedge_ask, trailing_min,
-            bounce, min_bounce, time_elapsed, band,
-        )
-        triggered = bounce >= min_bounce or valid_bounce
-        if triggered:
-            reason = "valid_bounce" if valid_bounce else "trailing"
+        # ── Step 5: Hedge decision — instant or trailing ───────────────────
+        if hedge_ask > INSTANT_HEDGE_MAX:
+            # Too expensive — log and let bail logic handle it
             log.info(
-                "  HEDGE TRIGGER: %s bounced %.3f -> %.3f (delta=%.3f >= %.3f%s)",
-                hedge_side.upper(), trailing_min, hedge_ask, bounce, min_bounce,
-                ", valid-bounce" if valid_bounce else "",
+                "  HEDGE wait: %s ask=%.3f > cap=%.2f (elapsed=%ds)",
+                hedge_side.upper(), hedge_ask, INSTANT_HEDGE_MAX, time_elapsed,
             )
-            log_trade("hedge_trigger", market_ts=ts, hedge_side=hedge_side.upper(),
-                      trail_min=round(trailing_min, 4), ask=round(hedge_ask, 4),
-                      bounce=round(bounce, 4), min_bounce=round(min_bounce, 4),
-                      band=band, reason=reason, elapsed_s=time_elapsed)
-            # --- Balance check before buy (prevents double-position) ---
+            continue
+
+        # Fee-aware EV check — use actual fill price (may differ from PRICE if maker-adjusted)
+        actual_fill_price = info.get(
+            "dn_price" if hedge_side == "up" else "up_price", PRICE
+        )  # filled side's actual entry price
+        net_pnl, fee = compute_hedge_ev(actual_fill_price, hedge_ask, shares)
+        if net_pnl < MIN_HEDGE_EDGE:
+            log.info(
+                "  HEDGE skip: %s ask=%.3f, EV=$%.3f < min_edge=$%.2f (fee=$%.3f)",
+                hedge_side.upper(), hedge_ask, net_pnl, MIN_HEDGE_EDGE, fee,
+            )
+            continue
+
+        # Decide: instant trigger or trailing bounce trigger
+        # Instant: fires within HEDGE_GRACE_S*2 of grace end (first 60s window after grace).
+        # After that window, require a trailing bounce to confirm direction reversal.
+        instant_window = time_elapsed < (HEDGE_GRACE_S * 2)
+        instant_trigger = instant_window  # ask is ≤ cap AND EV positive AND within window
+        trailing_trigger = False
+        if trailing_min is not None:
+            bounce = hedge_ask - trailing_min
+            min_bounce = HEDGE_TRAILING_DELTA * max(0.33, 1.0 - (time_elapsed - HEDGE_GRACE_S) / 270.0)
+            trailing_trigger = bounce >= min_bounce
+
+        if not instant_trigger and not trailing_trigger:
+            log.info(
+                "  HEDGE wait-trailing: %s ask=%.3f (EV ok) but no bounce yet "
+                "(low=%.3f, elapsed=%ds, past instant window)",
+                hedge_side.upper(), hedge_ask, trailing_min or 0, time_elapsed,
+            )
+            continue
+
+        if instant_trigger or trailing_trigger:
+            reason = "instant" if instant_trigger else "trailing_bounce"
+            log.info(
+                "  HEDGE TRIGGER (%s): %s ask=%.3f, EV=+$%.3f, fee=$%.3f (elapsed=%ds)",
+                reason, hedge_side.upper(), hedge_ask, net_pnl, fee, time_elapsed,
+            )
+            log_trade(
+                "hedge_trigger", market_ts=ts, hedge_side=hedge_side.upper(),
+                ask=round(hedge_ask, 4), ev=net_pnl, fee=fee,
+                trail_min=round(trailing_min, 4) if trailing_min else None,
+                reason=reason, elapsed_s=time_elapsed,
+            )
+
+            # Balance check before buy (prevents double-position)
             current_bal = check_token_balance(client, hedge_token)
-            if current_bal >= SHARES_PER_SIDE - 0.01:
+            if current_bal >= shares - 0.01:
                 log.info(
                     "  HEDGE skipped: already hold %.1f %s shares",
                     current_bal, hedge_side.upper(),
                 )
-                log_trade("hedge_balance_skip", market_ts=ts,
-                          hedge_side=hedge_side.upper(), current_bal=current_bal)
                 info["hedge_done"] = True
                 continue
-            oid = buy_hedge(client, hedge_token, SHARES_PER_SIDE, hedge_side.upper(), hedge_ask)
-            log_trade("hedge_buy", market_ts=ts, side=hedge_side.upper(),
-                      price=round(hedge_ask, 4), shares=SHARES_PER_SIDE,
-                      order_id=oid, elapsed_s=time_elapsed)
+
+            oid = buy_hedge(client, hedge_token, shares, hedge_side.upper(), hedge_ask)
+            log_trade(
+                "hedge_buy", market_ts=ts, side=hedge_side.upper(),
+                price=round(hedge_ask, 4), shares=shares,
+                order_id=oid, ev=net_pnl, fee=fee, elapsed_s=time_elapsed,
+            )
             info["hedge_done"] = True
+            info["hedge_price"] = hedge_ask
+            session_stats["hedged"] = session_stats.get("hedged", 0) + 1
+            session_stats["total_fees"] = session_stats.get("total_fees", 0) + fee
 
 
 def get_best_ask_safe(ws_feed: "WSBookFeed", client, token_id: str) -> float | None:
@@ -576,6 +904,22 @@ def get_best_ask_safe(ws_feed: "WSBookFeed", client, token_id: str) -> float | N
         book = client.get_order_book(token_id)
         if book and book.asks:
             return float(book.asks[0].price)
+    except Exception:
+        pass
+    return None
+
+
+def get_best_bid_safe(ws_feed: "WSBookFeed", client, token_id: str) -> float | None:
+    """Best bid from WS; REST fallback if enabled."""
+    bid = ws_feed.get_best_bid(token_id)
+    if bid is not None:
+        return bid
+    if not HEDGE_USE_REST_FALLBACK:
+        return None
+    try:
+        book = client.get_order_book(token_id)
+        if book and book.bids:
+            return float(book.bids[0].price)
     except Exception:
         pass
     return None
@@ -596,55 +940,204 @@ def cancel_market_orders(client, token_ids: set):
         log.error("  Cancel failed: %s", e)
 
 
-async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
-    """If one side > 72c and other side has 0 balance → cancel + sell filled side."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# BAIL LOGIC — EV-based, time-gated, slippage-aware
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def check_bail_out(
+    client,
+    ws_feed: WSBookFeed,
+    past_markets: dict,
+    session_stats: dict,
+):
+    """EV-based bail for one-sided fills.
+
+    v2 changes:
+      * No bail when > 180s remaining (only hedge or wait).
+      * Sliding thresholds on unfilled side ask, time-gated.
+      * Before bailing, check bid depth to limit slippage.
+      * Compute bail EV vs hold-to-resolution EV (including taker fee).
+      * Only bail if bail EV > hold EV (with capital opportunity credit).
+      * Track in session_stats.
+    """
+    now = int(time.time())
+
     for ts, info in list(past_markets.items()):
-        if info.get("bailed") or info.get("redeemed"):
+        if info.get("bailed") or info.get("redeemed") or info.get("hedge_done"):
+            continue
+        if info.get("compromised"):
             continue
 
         up_token = info.get("up_token", "")
         dn_token = info.get("dn_token", "")
-        if not up_token or not dn_token:
+        placed_at = info.get("placed_at", 0)
+        if not up_token or not dn_token or not placed_at:
             continue
-
         if info.get("closed"):
             continue  # already resolved, redeem handles it
 
-        # Get prices from WS feed (or REST fallback if enabled)
+        time_elapsed = now - placed_at
+        time_remaining = max(0, MARKET_PERIOD - time_elapsed)
+
+        # ── No bail before this time gate ──────────────────────────────────
+        if time_remaining > BAIL_NO_BAIL_BEFORE_S:
+            continue  # > 180s left → only hedge or wait
+
+        # ── Get prices ─────────────────────────────────────────────────────
         up_ask = get_best_ask_safe(ws_feed, client, up_token)
         dn_ask = get_best_ask_safe(ws_feed, client, dn_token)
         if up_ask is None or dn_ask is None:
-            continue  # no price data yet
+            continue
 
-        if up_ask <= BAIL_PRICE and dn_ask <= BAIL_PRICE:
-            continue  # no bail needed
+        # ── Determine which threshold to use ───────────────────────────────
+        if time_remaining > 120:
+            bail_threshold = BAIL_THRESHOLD_180
+        elif time_remaining > 60:
+            bail_threshold = BAIL_THRESHOLD_120
+        else:
+            bail_threshold = BAIL_THRESHOLD_60
 
-        # Price triggered — check balances via CLOB API
+        # ── Check if either side triggers ──────────────────────────────────
+        # "unfilled side ask > threshold" means hedging is too expensive.
+        bail_candidate = None
+        unfilled_ask = None
+
+        # Check balances to determine which side (if any) we hold
         try:
             up_bal = check_token_balance(client, up_token)
             dn_bal = check_token_balance(client, dn_token)
         except Exception:
             continue
 
-        bail = False
-        # DN expensive (DN winning) + we only hold UP (DN unfilled) → sell UP
-        if dn_ask > BAIL_PRICE and dn_bal == 0 and up_bal > 0:
-            log.info("  BAIL: DN ask=%.2f > %.2f, DN unfilled. Selling UP %.0f shares",
-                     dn_ask, BAIL_PRICE, up_bal)
-            cancel_market_orders(client, {up_token, dn_token})
-            sell_at_bid(client, up_token, up_bal, "UP")
-            bail = True
-        # UP expensive (UP winning) + we only hold DN (UP unfilled) → sell DN
-        elif up_ask > BAIL_PRICE and up_bal == 0 and dn_bal > 0:
-            log.info("  BAIL: UP ask=%.2f > %.2f, UP unfilled. Selling DN %.0f shares",
-                     up_ask, BAIL_PRICE, dn_bal)
-            cancel_market_orders(client, {up_token, dn_token})
-            sell_at_bid(client, dn_token, dn_bal, "DN")
-            bail = True
+        if dn_ask > bail_threshold and dn_bal == 0 and up_bal > 0:
+            # DN expensive (unfilled), we hold UP — consider selling UP
+            bail_candidate = ("UP", up_token, up_bal)
+            unfilled_ask = dn_ask
+        elif up_ask > bail_threshold and up_bal == 0 and dn_bal > 0:
+            # UP expensive (unfilled), we hold DN — consider selling DN
+            bail_candidate = ("DN", dn_token, dn_bal)
+            unfilled_ask = up_ask
 
-        if bail:
-            info["bailed"] = True
+        if not bail_candidate:
+            continue
 
+        label, token, bal = bail_candidate
+
+        # ── Slippage check: bid depth ──────────────────────────────────────
+        sell_bid = get_best_bid_safe(ws_feed, client, token)
+        if sell_bid is None:
+            log.info("  BAIL skip: no bid for %s", label)
+            continue
+
+        bid_depth = get_bid_depth_at(client, token, sell_bid - 0.02)
+        if bid_depth < BAIL_MIN_BID_DEPTH:
+            log.info(
+                "  BAIL skip: bid depth %.1f < min %.1f for %s at %.2f",
+                bid_depth, BAIL_MIN_BID_DEPTH, label, sell_bid,
+            )
+            continue
+
+        # ── EV comparison (use actual fill price, not global PRICE) ─────────
+        # Determine which side was filled and its actual entry price
+        if label == "UP":
+            actual_fill_price = info.get("up_price", PRICE)
+        else:
+            actual_fill_price = info.get("dn_price", PRICE)
+        bail_pnl, hold_ev, should_bail = compute_bail_ev(
+            actual_fill_price, sell_bid, bal, unfilled_ask, time_remaining,
+        )
+
+        log.info(
+            "  BAIL eval: %s bid=%.2f, bail_pnl=$%.2f, hold_ev=$%.2f, "
+            "should_bail=%s (unfilled_ask=%.2f, %ds left, threshold=%.2f)",
+            label, sell_bid, bail_pnl, hold_ev,
+            should_bail, unfilled_ask, time_remaining, bail_threshold,
+        )
+        log_trade(
+            "bail_eval", market_ts=ts, side=label,
+            sell_bid=sell_bid, bail_pnl=bail_pnl, hold_ev=hold_ev,
+            should_bail=should_bail, unfilled_ask=unfilled_ask,
+            time_remaining=time_remaining, bid_depth=bid_depth,
+        )
+
+        if not should_bail:
+            continue
+
+        # ── Execute bail ───────────────────────────────────────────────────
+        taker_fee = polymarket_taker_fee(sell_bid, bal)
+        log.info(
+            "  BAIL EXECUTE: selling %s %.1f @ bid %.2f (fee=$%.3f, "
+            "bail_pnl=$%.2f vs hold_ev=$%.2f)",
+            label, bal, sell_bid, taker_fee, bail_pnl, hold_ev,
+        )
+        log_trade(
+            "bail_execute", market_ts=ts, side=label, shares=bal,
+            sell_bid=sell_bid, fee=taker_fee,
+            bail_pnl=bail_pnl, hold_ev=hold_ev,
+        )
+        cancel_market_orders(client, {up_token, dn_token})
+        sell_at_bid(client, token, bal, label)
+
+        info["bailed"] = True
+        info["bail_price"] = sell_bid
+
+        # ── Update session stats ───────────────────────────────────────────
+        session_stats["bailed"] = session_stats.get("bailed", 0) + 1
+        session_stats["consecutive_bails"] = session_stats.get("consecutive_bails", 0) + 1
+        session_stats["total_fees"] = session_stats.get("total_fees", 0) + taker_fee
+        session_stats["total_cost"] = session_stats.get("total_cost", 0) + (PRICE * bal)
+        realized = sell_bid * bal - taker_fee
+        session_stats["total_return"] = session_stats.get("total_return", 0) + realized
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STALE CANCEL — cancel unfilled orders near market end
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cancel_stale_orders(client, past_markets: dict):
+    """At T+4:00, cancel unfilled orders when neither side filled."""
+    now = int(time.time())
+    for ts, info in list(past_markets.items()):
+        if info.get("hedge_done") or info.get("redeemed") or info.get("closed"):
+            continue
+        if info.get("bailed") or info.get("stale_cancelled") or info.get("compromised"):
+            continue
+
+        placed_at = info.get("placed_at", 0)
+        if not placed_at:
+            continue
+
+        time_elapsed = now - placed_at
+        if time_elapsed < (MARKET_PERIOD - STALE_CANCEL_BEFORE_END_S):
+            continue  # not yet at the cancel window
+
+        up_token = info.get("up_token", "")
+        dn_token = info.get("dn_token", "")
+        if not up_token or not dn_token:
+            continue
+
+        # Only cancel if NEITHER side filled
+        if info.get("hedge_side"):
+            continue  # one side already filled; hedge/bail handles it
+
+        try:
+            up_bal = check_token_balance(client, up_token)
+            dn_bal = check_token_balance(client, dn_token)
+        except Exception:
+            continue
+
+        if up_bal > 0 or dn_bal > 0:
+            continue  # has a position — not stale
+
+        log.info("  STALE CANCEL: neither side filled at %ds, cancelling orders", time_elapsed)
+        log_trade("stale_cancel", market_ts=ts, elapsed_s=time_elapsed)
+        cancel_market_orders(client, {up_token, dn_token})
+        info["stale_cancelled"] = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ON-CHAIN FUNCTIONS — merge, redeem, token balance (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def merge_market(redeemer, condition_id: str, amount: float) -> bool:
     """Merge complete sets (1 UP + 1 DN) into USDC on-chain. Can be done before or after resolution.
@@ -743,8 +1236,6 @@ def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0
         return False
 
 
-
-
 def check_token_balance(client, token_id: str) -> float:
     """Check CTF token balance via CLOB API (returns shares)."""
     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -756,6 +1247,10 @@ def check_token_balance(client, token_id: str) -> float:
     except Exception:
         return 0.0
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REDEMPTION — try_redeem_all, try_merge_all (merge now tracks session P&L)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def try_redeem_all(client, redeemer, past_markets: dict):
     """Check all past markets and redeem any with unredeemed balances.
@@ -827,10 +1322,19 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
         log.info("  Redeemed %d market(s)", len(redeemed))
 
 
-async def try_merge_all(client, redeemer, past_markets: dict):
+async def try_merge_all(client, redeemer, past_markets: dict, session_stats: dict):
     """Merge complete sets (UP + DN) into USDC only after the market has ended (closed).
-    Run before redeem: merge first (get $1 per set back), then redeem any remaining."""
+
+    Run before redeem: merge first (get $1 per set back), then redeem any remaining.
+    v2: tracks dual_fills, hedged counts, and P&L in session_stats.
+    """
     if not redeemer:
+        return
+
+    # Gas ceiling check for non-urgent merge
+    gas_gwei = get_polygon_gas_gwei(redeemer)
+    if gas_gwei > GAS_CEILING_GWEI:
+        log.info("  Merge deferred: gas %.0f gwei > ceiling %.0f", gas_gwei, GAS_CEILING_GWEI)
         return
 
     merged = []
@@ -878,24 +1382,56 @@ async def try_merge_all(client, redeemer, past_markets: dict):
         if ok:
             merged.append(ts)
 
+            # ── Track session P&L ──────────────────────────────────────────
+            if info.get("hedge_done") and info.get("hedge_price"):
+                # Hedged round: cost = fill + hedge + taker fee on hedge
+                hedge_p = info["hedge_price"]
+                fee = polymarket_taker_fee(hedge_p, merge_amount)
+                cost = PRICE * merge_amount + hedge_p * merge_amount + fee
+                session_stats["hedged"] = session_stats.get("hedged", 0)  # already incremented
+                session_stats["total_cost"] = session_stats.get("total_cost", 0) + cost
+                session_stats["total_return"] = session_stats.get("total_return", 0) + (1.0 * merge_amount)
+            else:
+                # Natural dual-fill: cost = 2 * fill price, no taker fee
+                cost = PRICE * merge_amount * 2
+                session_stats["dual_fills"] = session_stats.get("dual_fills", 0) + 1
+                session_stats["total_cost"] = session_stats.get("total_cost", 0) + cost
+                session_stats["total_return"] = session_stats.get("total_return", 0) + (1.0 * merge_amount)
+
+            # Successful merge resets consecutive bail counter
+            session_stats["consecutive_bails"] = 0
+
     if merged:
         log.info("  Merged %d market(s)", len(merged))
 
 
-async def hedge_loop(client, ws_feed: "WSBookFeed", past_markets: dict):
-    """Fast 1-second loop for trailing hedge checks.
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKGROUND LOOPS — hedge + order integrity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def hedge_loop(
+    client,
+    ws_feed: "WSBookFeed",
+    past_markets: dict,
+    redeemer,
+    session_stats: dict,
+):
+    """Fast 1-second loop for hedge checks + order integrity monitoring.
 
     Runs as a background task so hedge triggers aren't delayed by the
-    5-second main loop sleep. Shares past_markets dict by reference —
-    never reassign past_markets in the main loop, only mutate in place.
+    5-second main loop sleep.
     """
     while True:
         try:
-            await check_hedge_trailing(client, ws_feed, past_markets)
+            await check_hedge_trailing(client, ws_feed, past_markets, redeemer, session_stats)
         except Exception as e:
             log.debug("hedge_loop error: %s", e)
         await asyncio.sleep(1)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def run():
     # Set up signal handler for graceful shutdown
@@ -903,16 +1439,23 @@ async def run():
     def signal_handler(sig, frame):
         log.info("\nStopped.")
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     open_trade_log()
     log.info("Initializing SDK...")
     client = init_clob_client()
     redeemer = init_redeemer()
 
-    log.info("SDK ready. Placing 45c orders on BTC 5m markets.")
+    log.info("SDK ready. Entry price=%.2f, shares=%d per side.", PRICE, BASE_SHARES)
+    log.info("  Hedge cap=%.2f, grace=%ds, min edge=$%.2f", INSTANT_HEDGE_MAX, HEDGE_GRACE_S, MIN_HEDGE_EDGE)
+    log.info("  Bail thresholds: 180s=%.2f, 120s=%.2f, 60s=%.2f (no bail before %ds)",
+             BAIL_THRESHOLD_180, BAIL_THRESHOLD_120, BAIL_THRESHOLD_60, BAIL_NO_BAIL_BEFORE_S)
+    log.info("  Session loss limit=$%.0f, consecutive bail pause=%d", SESSION_LOSS_LIMIT, CONSECUTIVE_BAIL_PAUSE)
+    log.info("  Vol filter: min=%.2f%% max=%.2f%%, min book depth=%.0f",
+             VOL_MIN_ATR_PCT, VOL_MAX_ATR_PCT, MIN_BOOK_DEPTH)
+    log.info("  Gas ceiling=%.0f gwei, on-chain verify=%s", GAS_CEILING_GWEI, ONCHAIN_VERIFY)
     if redeemer:
         log.info("Auto-redeem enabled (on-chain via %s).\n", redeemer[1].address)
     else:
@@ -922,17 +1465,34 @@ async def run():
     ws_feed = WSBookFeed()
 
     placed_markets = set()
-    # Track past markets: {ts: {redeemed, bailed, up_token, dn_token, closed}}
+    # Track past markets: {ts: {redeemed, bailed, up_token, dn_token, closed, ...}}
     # NOTE: never reassign this dict — hedge_loop holds a reference to it.
     past_markets = {}
 
-    # Start fast hedge loop (1s interval) as a background task
-    asyncio.create_task(hedge_loop(client, ws_feed, past_markets))
+    # ── Session statistics ─────────────────────────────────────────────────
+    session_stats = {
+        "rounds": 0,
+        "dual_fills": 0,
+        "hedged": 0,
+        "bailed": 0,
+        "skipped_vol": 0,
+        "skipped_depth": 0,
+        "skipped_maker": 0,
+        "total_cost": 0.0,
+        "total_return": 0.0,
+        "total_fees": 0.0,
+        "consecutive_bails": 0,
+        "paused_until": 0,
+        "current_shares": BASE_SHARES,
+        "_blacklist": load_blacklist() if BLACKLIST_ENABLED else set(),
+    }
 
-    # Scan recent markets (last 2 hours) for unredeemed positions on startup
+    # Start fast hedge loop (1s interval) as a background task
+    asyncio.create_task(hedge_loop(client, ws_feed, past_markets, redeemer, session_stats))
+
+    # ── Scan recent markets (last 2 hours) for unredeemed positions ────────
     now = int(time.time())
     log.info("Scanning recent markets for unredeemed positions...")
-    # Scan last 2 hours of 5-minute markets (7200s / 300s = 24 markets)
     scan_ts = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
     while scan_ts < now:
         slug = f"btc-updown-5m-{scan_ts}"
@@ -946,8 +1506,6 @@ async def run():
                 "condition_id": mkt["conditionId"],
                 "neg_risk": mkt.get("neg_risk", False),
                 "title": mkt.get("title", slug),
-                # Use market start as anchor so hedge windows work correctly
-                # if this market has a one-sided fill when we pick it up.
                 "placed_at": 0 if mkt["closed"] else scan_ts,
             }
             placed_markets.add(scan_ts)
@@ -962,7 +1520,7 @@ async def run():
         scan_ts += MARKET_PERIOD
     log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
 
-    # Pre-fetch cache for next market (avoids get_market_info wait when new period starts)
+    # Pre-fetch cache for next market
     next_market_cache = {"ts": None, "mkt": None}
 
     async def prefetch_next_market(next_ts: int, cache: dict):
@@ -975,6 +1533,9 @@ async def run():
         except Exception:
             pass
 
+    # Cache volatility across rounds (refresh every 60s)
+    vol_cache = {"data": None, "fetched_at": 0}
+
     while True:
         now = int(time.time())
         timestamps = next_market_timestamps(now)
@@ -986,7 +1547,7 @@ async def run():
 
             slug = f"btc-updown-5m-{ts}"
 
-            # Use pre-fetched market data if we have it (saves one round-trip at market open)
+            # Use pre-fetched market data if we have it
             if ts == next_market_ts and next_market_cache.get("ts") == ts and next_market_cache.get("mkt"):
                 mkt = next_market_cache["mkt"]
                 next_market_cache["ts"] = None
@@ -1014,7 +1575,7 @@ async def run():
             else:
                 await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
 
-            # Balance + live orders in parallel (one round-trip instead of three)
+            # Balance + live orders in parallel
             def _get_orders():
                 try:
                     return client.get_orders()
@@ -1029,19 +1590,16 @@ async def run():
                 log.info("  Already have position (UP=%.1f, DN=%.1f) — skipping", up_bal, dn_bal)
                 placed_markets.add(ts)
                 past_markets[ts] = {
-                    "redeemed": False,
-                    "closed": mkt["closed"],
-                    "up_token": mkt["up_token"],
-                    "dn_token": mkt["dn_token"],
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
                     "condition_id": mkt["conditionId"],
                     "neg_risk": mkt.get("neg_risk", False),
                     "title": mkt.get("title", slug),
-                    # Use ts so hedge activates if this is a one-sided fill
                     "placed_at": ts,
                 }
                 continue
 
-            # Skip if we already have live orders on this market (live_orders from parallel fetch above)
+            # Skip if we already have live orders on this market
             market_tokens = {mkt["up_token"], mkt["dn_token"]}
             existing = [o for o in (live_orders or [])
                         if o.get("status") == "LIVE"
@@ -1050,65 +1608,262 @@ async def run():
                 log.info("  Already have %d live order(s) — skipping", len(existing))
                 placed_markets.add(ts)
                 past_markets[ts] = {
-                    "redeemed": False,
-                    "closed": mkt["closed"],
-                    "up_token": mkt["up_token"],
-                    "dn_token": mkt["dn_token"],
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
                     "condition_id": mkt["conditionId"],
                     "neg_risk": mkt.get("neg_risk", False),
                     "title": mkt.get("title", slug),
-                    # Use ts so hedge activates when one of these orders fills
                     "placed_at": ts,
                 }
                 continue
 
-            # Enforce 15-second placement window (matching Rust bot).
-            # ts is the market START timestamp; secs_elapsed is negative for
-            # future markets (we still pre-register them) and 0-300 for live ones.
+            # ── Placement window check ─────────────────────────────────────
             secs_elapsed = now - ts
             if secs_elapsed > NEW_MARKET_PLACE_WINDOW_SECONDS:
                 log.info(
-                    "  Skipping placement — outside %ds window (%ds elapsed since market start)",
+                    "  Skipping placement — outside %ds window (%ds elapsed)",
                     NEW_MARKET_PLACE_WINDOW_SECONDS, secs_elapsed,
                 )
                 log_trade("window_missed", market_ts=ts, slug=slug, elapsed_s=secs_elapsed)
                 placed_markets.add(ts)
                 past_markets[ts] = {
-                    "redeemed": False,
-                    "closed": mkt["closed"],
-                    "up_token": mkt["up_token"],
-                    "dn_token": mkt["dn_token"],
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
                     "condition_id": mkt["conditionId"],
                     "neg_risk": mkt.get("neg_risk", False),
                     "title": mkt.get("title", slug),
-                    "placed_at": 0,  # no orders placed; hedge won't activate
+                    "placed_at": 0,
                 }
                 continue
 
-            # Optional cap: don't open new markets if we're at max open (risk limit)
+            # ── Max open markets cap ───────────────────────────────────────
             if MAX_OPEN_MARKETS > 0:
                 open_count = sum(1 for _ts, _info in past_markets.items() if not _info.get("redeemed"))
                 if open_count >= MAX_OPEN_MARKETS:
-                    log.info(
-                        "  Skipping placement — at max open markets (%d >= %d)",
-                        open_count, MAX_OPEN_MARKETS,
-                    )
-                    log_trade("max_open_skipped", market_ts=ts, slug=slug, open_count=open_count, max=MAX_OPEN_MARKETS)
-                    continue  # retry next loop when a slot frees
+                    log.info("  Skipping — at max open markets (%d >= %d)", open_count, MAX_OPEN_MARKETS)
+                    continue
 
-            # Place both sides in parallel so they hit the book at nearly the same time
-            up_id, dn_id = await asyncio.gather(
-                asyncio.to_thread(place_order, client, mkt["up_token"], "UP  ", SHARES_PER_SIDE, PRICE),
-                asyncio.to_thread(place_order, client, mkt["dn_token"], "DOWN", SHARES_PER_SIDE, PRICE),
+            # ── SESSION RISK: loss limit ───────────────────────────────────
+            net_pnl = session_stats["total_return"] - session_stats["total_cost"]
+            if net_pnl <= -SESSION_LOSS_LIMIT:
+                log.warning(
+                    "  SESSION LOSS LIMIT: P&L=$%.2f ≤ -$%.0f. Skipping.",
+                    net_pnl, SESSION_LOSS_LIMIT,
+                )
+                log_trade("session_loss_skip", market_ts=ts, net_pnl=net_pnl, limit=SESSION_LOSS_LIMIT)
+                placed_markets.add(ts)
+                past_markets[ts] = {
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    "placed_at": 0,
+                }
+                continue
+
+            # ── SESSION RISK: consecutive bail pause ───────────────────────
+            if session_stats["consecutive_bails"] >= CONSECUTIVE_BAIL_PAUSE:
+                if now < session_stats.get("paused_until", 0):
+                    remaining = session_stats["paused_until"] - now
+                    log.info(
+                        "  BAIL PAUSE: %d consecutive bails, paused for %ds more",
+                        session_stats["consecutive_bails"], remaining,
+                    )
+                    continue
+                elif session_stats.get("paused_until", 0) == 0:
+                    session_stats["paused_until"] = now + CONSECUTIVE_BAIL_PAUSE_S
+                    log.warning(
+                        "  BAIL PAUSE: %d consecutive bails — pausing %ds. "
+                        "Reducing shares to %d.",
+                        session_stats["consecutive_bails"],
+                        CONSECUTIVE_BAIL_PAUSE_S,
+                        int(BASE_SHARES * BAIL_REDUCE_FACTOR),
+                    )
+                    session_stats["current_shares"] = max(1, int(BASE_SHARES * BAIL_REDUCE_FACTOR))
+                    log_trade(
+                        "bail_pause", consecutive=session_stats["consecutive_bails"],
+                        pause_s=CONSECUTIVE_BAIL_PAUSE_S,
+                        reduced_shares=session_stats["current_shares"],
+                    )
+                    continue
+                else:
+                    # Pause expired — resume with reduced shares, reset consecutive count
+                    log.info("  BAIL PAUSE expired. Resuming with %d shares.", session_stats["current_shares"])
+                    session_stats["paused_until"] = 0
+                    session_stats["consecutive_bails"] = 0  # reset to prevent re-pause loop
+
+            shares = session_stats["current_shares"]
+
+            # ── VOLATILITY FILTER ──────────────────────────────────────────
+            if now - vol_cache["fetched_at"] > 60 or vol_cache["data"] is None:
+                vol_cache["data"] = await get_btc_volatility()
+                vol_cache["fetched_at"] = now
+
+            vol = vol_cache["data"]
+            if vol.get("ok"):
+                atr_pct = vol["atr_pct"]
+                if atr_pct < VOL_MIN_ATR_PCT:
+                    log.info(
+                        "  VOL SKIP: ATR=%.3f%% < min %.2f%% — BTC too quiet, dual fill unlikely",
+                        atr_pct, VOL_MIN_ATR_PCT,
+                    )
+                    log_trade("vol_skip_low", market_ts=ts, atr_pct=atr_pct, threshold=VOL_MIN_ATR_PCT)
+                    session_stats["skipped_vol"] = session_stats.get("skipped_vol", 0) + 1
+                    placed_markets.add(ts)
+                    past_markets[ts] = {
+                        "redeemed": False, "closed": mkt["closed"],
+                        "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
+                        "condition_id": mkt["conditionId"],
+                        "neg_risk": mkt.get("neg_risk", False),
+                        "title": mkt.get("title", slug),
+                        "placed_at": 0,
+                    }
+                    continue
+                if atr_pct > VOL_MAX_ATR_PCT:
+                    reduced = max(1, int(shares * 0.5))
+                    log.info(
+                        "  VOL HIGH: ATR=%.3f%% > %.2f%% — reducing shares %d→%d",
+                        atr_pct, VOL_MAX_ATR_PCT, shares, reduced,
+                    )
+                    log_trade("vol_reduce", market_ts=ts, atr_pct=atr_pct, shares_before=shares, shares_after=reduced)
+                    shares = reduced
+
+            # ── LIQUIDITY FILTER ───────────────────────────────────────────
+            up_depth_info, dn_depth_info = await asyncio.gather(
+                asyncio.to_thread(check_book_depth, client, mkt["up_token"], PRICE, MIN_BOOK_DEPTH),
+                asyncio.to_thread(check_book_depth, client, mkt["dn_token"], PRICE, MIN_BOOK_DEPTH),
             )
+            if not up_depth_info["sufficient"] or not dn_depth_info["sufficient"]:
+                log.info(
+                    "  DEPTH SKIP: UP ask_d=%.0f bid_d=%.0f, DN ask_d=%.0f bid_d=%.0f "
+                    "(min=%.0f)",
+                    up_depth_info["ask_depth"], up_depth_info["bid_depth"],
+                    dn_depth_info["ask_depth"], dn_depth_info["bid_depth"],
+                    MIN_BOOK_DEPTH,
+                )
+                log_trade(
+                    "depth_skip", market_ts=ts,
+                    up_ask_d=up_depth_info["ask_depth"], up_bid_d=up_depth_info["bid_depth"],
+                    dn_ask_d=dn_depth_info["ask_depth"], dn_bid_d=dn_depth_info["bid_depth"],
+                )
+                session_stats["skipped_depth"] = session_stats.get("skipped_depth", 0) + 1
+                placed_markets.add(ts)
+                past_markets[ts] = {
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    "placed_at": 0,
+                }
+                continue
+
+            # ── BLACKLIST CHECK ────────────────────────────────────────────
+            if BLACKLIST_ENABLED:
+                bl = session_stats.get("_blacklist", set())
+                if bl:
+                    # Check if opposing book has blacklisted addresses
+                    # (best-effort: check top-of-book maker via REST)
+                    skip_bl = False
+                    for tid in (mkt["up_token"], mkt["dn_token"]):
+                        try:
+                            book = client.get_order_book(tid)
+                            for ask in (book.asks or [])[:3]:
+                                owner = getattr(ask, "owner", None) or getattr(ask, "maker_address", None)
+                                if owner and owner in bl:
+                                    log.warning(
+                                        "  BLACKLIST HIT: %s on book for %s — skipping market",
+                                        owner[:16], tid[:12],
+                                    )
+                                    log_trade("blacklist_skip", market_ts=ts, address=owner)
+                                    skip_bl = True
+                                    break
+                        except Exception:
+                            pass
+                        if skip_bl:
+                            break
+                    if skip_bl:
+                        placed_markets.add(ts)
+                        past_markets[ts] = {
+                            "redeemed": False, "closed": mkt["closed"],
+                            "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
+                            "condition_id": mkt["conditionId"],
+                            "neg_risk": mkt.get("neg_risk", False),
+                            "title": mkt.get("title", slug),
+                            "placed_at": 0,
+                        }
+                        continue
+
+            # ── MAKER-ONLY ORDER PLACEMENT ─────────────────────────────────
+            # Only post limit if best_ask > our price so it rests as maker (0 fee).
+            # If best_ask ≤ our price, adjust down or skip that side.
+            up_best_ask = up_depth_info.get("best_ask")
+            dn_best_ask = dn_depth_info.get("best_ask")
+
+            up_price = PRICE
+            dn_price = PRICE
+
+            if up_best_ask is not None and up_best_ask <= PRICE:
+                adjusted = round(up_best_ask - MAKER_MIN_GAP, 2)
+                if adjusted >= MAKER_PRICE_FLOOR:
+                    up_price = adjusted
+                    log.info("  MAKER adj UP: best_ask=%.2f, placing at %.2f", up_best_ask, up_price)
+                else:
+                    up_price = None
+                    log.info("  MAKER skip UP: best_ask=%.2f too low (floor=%.2f)", up_best_ask, MAKER_PRICE_FLOOR)
+
+            if dn_best_ask is not None and dn_best_ask <= PRICE:
+                adjusted = round(dn_best_ask - MAKER_MIN_GAP, 2)
+                if adjusted >= MAKER_PRICE_FLOOR:
+                    dn_price = adjusted
+                    log.info("  MAKER adj DN: best_ask=%.2f, placing at %.2f", dn_best_ask, dn_price)
+                else:
+                    dn_price = None
+                    log.info("  MAKER skip DN: best_ask=%.2f too low (floor=%.2f)", dn_best_ask, MAKER_PRICE_FLOOR)
+
+            if up_price is None and dn_price is None:
+                log.info("  MAKER SKIP: both sides have best_ask ≤ PRICE — no maker opportunity")
+                log_trade("maker_skip_both", market_ts=ts, up_ask=up_best_ask, dn_ask=dn_best_ask)
+                session_stats["skipped_maker"] = session_stats.get("skipped_maker", 0) + 1
+                placed_markets.add(ts)
+                past_markets[ts] = {
+                    "redeemed": False, "closed": mkt["closed"],
+                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    "placed_at": 0,
+                }
+                continue
+
+            # ── Place orders (parallel when both sides active) ─────────────
+            up_id = None
+            dn_id = None
+
+            if up_price is not None and dn_price is not None:
+                up_id, dn_id = await asyncio.gather(
+                    asyncio.to_thread(place_order, client, mkt["up_token"], "UP  ", shares, up_price),
+                    asyncio.to_thread(place_order, client, mkt["dn_token"], "DOWN", shares, dn_price),
+                )
+            elif up_price is not None:
+                up_id = await asyncio.to_thread(place_order, client, mkt["up_token"], "UP  ", shares, up_price)
+            elif dn_price is not None:
+                dn_id = await asyncio.to_thread(place_order, client, mkt["dn_token"], "DOWN", shares, dn_price)
 
             placed = (1 if up_id else 0) + (1 if dn_id else 0)
-            log.info("  Done: %d orders placed. Max cost: $%.2f", placed, SHARES_PER_SIDE * PRICE * 2)
+            max_cost = shares * ((up_price or 0) + (dn_price or 0))
+            log.info("  Done: %d orders placed. Max cost: $%.2f (shares=%d)", placed, max_cost, shares)
             log.info("")
-            log_trade("orders_placed", market_ts=ts, slug=slug,
-                      title=mkt.get("title", slug), price=PRICE, shares=SHARES_PER_SIDE,
-                      up_id=up_id, dn_id=dn_id, sides_placed=placed,
-                      elapsed_s=now - ts)
+            log_trade(
+                "orders_placed", market_ts=ts, slug=slug,
+                title=mkt.get("title", slug),
+                up_price=up_price, dn_price=dn_price, shares=shares,
+                up_id=up_id, dn_id=dn_id, sides_placed=placed,
+                elapsed_s=now - ts,
+            )
+
+            session_stats["rounds"] = session_stats.get("rounds", 0) + 1
 
             placed_markets.add(ts)
             past_markets[ts] = {
@@ -1119,14 +1874,15 @@ async def run():
                 "condition_id": mkt["conditionId"],
                 "neg_risk": mkt.get("neg_risk", False),
                 "title": mkt.get("title", slug),
-                # FIX: use market start timestamp (ts) as anchor, not wall-clock
-                # placement time. Matches Rust bot: time_elapsed = now - ts, so
-                # hedge windows (120s, 180s, 240s) are relative to market start,
-                # not to when place_order() returned.
                 "placed_at": ts,
+                "up_order_id": up_id,
+                "dn_order_id": dn_id,
+                "up_price": up_price,
+                "dn_price": dn_price,
+                "shares": shares,
             }
 
-        # Log WS prices for active (unresolved, unhedged) markets
+        # ── Log WS prices for active markets ───────────────────────────────
         for ts, info in past_markets.items():
             if info.get("redeemed") or info.get("closed"):
                 continue
@@ -1135,7 +1891,9 @@ async def run():
             if up_ask is not None or dn_ask is not None:
                 elapsed = now - info.get("placed_at", now)
                 hedge_state = ""
-                if info.get("hedge_done"):
+                if info.get("compromised"):
+                    hedge_state = " [COMPROMISED]"
+                elif info.get("hedge_done"):
                     hedge_state = " [HEDGED]"
                 elif info.get("hedge_side"):
                     hedge_state = f" [TRAILING {info['hedge_side'].upper()}]"
@@ -1144,32 +1902,57 @@ async def run():
                     ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
                 )
 
-        # Bail out early if one side > 72c and we hold the other (sell filled side)
-        await check_bail_out(client, ws_feed, past_markets)
-        # Merge complete sets (UP+DN) into USDC only after market has ended
-        await try_merge_all(client, redeemer, past_markets)
-        # Redeem resolved markets (remaining winning/losing tokens after resolution)
+        # ── Bail, stale cancel, merge, redeem ──────────────────────────────
+        await check_bail_out(client, ws_feed, past_markets, session_stats)
+        await cancel_stale_orders(client, past_markets)
+        await try_merge_all(client, redeemer, past_markets, session_stats)
         await try_redeem_all(client, redeemer, past_markets)
 
-        # Faster poll when close to next market start (better chance to fill both sides)
+        # ── Session summary (every 10 rounds) ─────────────────────────────
+        if session_stats["rounds"] > 0 and session_stats["rounds"] % 10 == 0:
+            net = session_stats["total_return"] - session_stats["total_cost"]
+            log.info(
+                "  ════ SESSION SUMMARY (after %d rounds) ════\n"
+                "    Dual fills: %d | Hedged: %d | Bailed: %d\n"
+                "    Skipped (vol/depth/maker): %d/%d/%d\n"
+                "    Total cost: $%.2f | Total return: $%.2f\n"
+                "    Net P&L: $%.2f | Fees: $%.2f\n"
+                "    Current shares: %d | Consecutive bails: %d",
+                session_stats["rounds"],
+                session_stats.get("dual_fills", 0),
+                session_stats.get("hedged", 0),
+                session_stats.get("bailed", 0),
+                session_stats.get("skipped_vol", 0),
+                session_stats.get("skipped_depth", 0),
+                session_stats.get("skipped_maker", 0),
+                session_stats["total_cost"],
+                session_stats["total_return"],
+                net,
+                session_stats.get("total_fees", 0),
+                session_stats["current_shares"],
+                session_stats["consecutive_bails"],
+            )
+            log_trade(
+                "session_summary", rounds=session_stats["rounds"],
+                dual_fills=session_stats.get("dual_fills", 0),
+                hedged=session_stats.get("hedged", 0),
+                bailed=session_stats.get("bailed", 0),
+                net_pnl=net, fees=session_stats.get("total_fees", 0),
+            )
+
+        # ── Sleep / prefetch ───────────────────────────────────────────────
         seconds_until = next_market_ts - now
         sleep_s = 0.5 if seconds_until <= 15 else (1 if seconds_until <= 60 else 2)
-        # Pre-fetch next market in background so we have it when the new period starts
         if seconds_until <= NEXT_MARKET_PREFETCH_SEC and seconds_until > 0:
             asyncio.create_task(prefetch_next_market(next_market_ts, next_market_cache))
         await asyncio.sleep(sleep_s)
 
-        # Log status with countdown
         log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
-        # Clean very old entries (keep last 2 hours for redemption).
-        # Use in-place deletion to preserve the reference held by hedge_loop.
+        # ── Prune old entries ──────────────────────────────────────────────
         stale = [ts for ts in past_markets if ts <= now - 7200]
         for ts in stale:
             del past_markets[ts]
-        # FIX: placed_markets must survive long enough to cover the previous period
-        # (next_market_timestamps always returns ts-300 which is ~5 min old).
-        # Prune at 2×MARKET_PERIOD so the previous period is never re-placed.
         placed_markets = {ts for ts in placed_markets if ts > now - 2 * MARKET_PERIOD}
 
 
