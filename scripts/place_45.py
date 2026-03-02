@@ -30,6 +30,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import signal
 import sys
 import time
 
@@ -411,8 +413,28 @@ def save_blacklist(bl: set):
         pass
 
 
+def _market_entry(mkt: dict, slug: str, placed_at: int = 0, **extra) -> dict:
+    """Build a past_markets entry dict from a market info response.
+
+    All repeated past_markets[ts] = {...} blocks use this helper so that
+    the field set is defined exactly once and callers only supply what differs.
+    Extra kwargs (e.g. up_order_id, shares, btc_at_place) are merged in.
+    """
+    return {
+        "redeemed": False,
+        "closed": mkt["closed"],
+        "up_token": mkt["up_token"],
+        "dn_token": mkt["dn_token"],
+        "condition_id": mkt["conditionId"],
+        "neg_risk": mkt.get("neg_risk", False),
+        "title": mkt.get("title", slug),
+        "placed_at": placed_at,
+        **extra,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS — timestamps, slugs, validation (unchanged)
+# UTILITY FUNCTIONS — timestamps, slugs, validation
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def next_market_timestamps(now_ts: int) -> list[int]:
@@ -464,7 +486,6 @@ async def get_market_info(slug: str) -> dict:
     if len(slug) > 200:
         raise ValueError(f"Invalid slug: too long (max 200 chars), got {len(slug)}")
     # Only allow expected slug pattern
-    import re
     if not re.match(r"^btc-updown-5m-\d+$", slug):
         raise ValueError(f"Invalid slug format: expected btc-updown-5m-<timestamp>, got {slug}")
 
@@ -593,35 +614,46 @@ def place_order(client, token_id: str, side_label: str, shares: float, price: fl
 
 
 def sell_at_bid(client, token_id: str, shares: float, side_label: str) -> str | None:
-    """Place a limit SELL at the current best bid. Returns order ID or None."""
+    """Place a limit SELL at the current best bid. Returns order ID or None.
+
+    Retries up to 3 times with 1s delay. A bail sell that silently fails
+    leaves the position stranded, so we always retry before giving up.
+    """
     from py_clob_client.order_builder.constants import SELL
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    try:
-        book = client.get_order_book(token_id)
-        if not book.bids:
-            log.warning("  %s no bids to sell into", side_label)
-            return None
-        best_bid = float(book.bids[0].price)
-        log.info("  %s SELL %.0f @ %.2f (best bid)", side_label, shares, best_bid)
+    for attempt in range(1, 4):
+        try:
+            book = client.get_order_book(token_id)
+            if not book.bids:
+                log.warning("  %s no bids to sell into (attempt %d/3)", side_label, attempt)
+                if attempt < 3:
+                    time.sleep(1)
+                    continue
+                return None
+            best_bid = float(book.bids[0].price)
+            log.info("  %s SELL %.0f @ %.2f (best bid)", side_label, shares, best_bid)
 
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=best_bid,
-            size=round(shares, 1),
-            side=SELL,
-            expiration=int(time.time()) + 300,  # 5 min expiry
-        )
-        signed = client.create_order(order_args)
-        result = client.post_order(signed, OrderType.GTD)
-        oid = result.get("orderID", result.get("id", ""))
-        if oid:
-            log.info("  %s SELL placed [%s]", side_label, oid[:12])
-            return oid
-        else:
-            log.warning("  %s SELL no order ID: %s", side_label, result)
-    except Exception as e:
-        log.error("  %s SELL failed: %s", side_label, e)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=best_bid,
+                size=round(shares, 1),
+                side=SELL,
+                expiration=int(time.time()) + 300,  # 5 min expiry
+            )
+            signed = client.create_order(order_args)
+            result = client.post_order(signed, OrderType.GTD)
+            oid = result.get("orderID", result.get("id", ""))
+            if oid:
+                log.info("  %s SELL placed [%s]", side_label, oid[:12])
+                return oid
+            else:
+                log.warning("  %s SELL no order ID: %s (attempt %d/3)", side_label, result, attempt)
+        except Exception as e:
+            log.error("  %s SELL failed (attempt %d/3): %s", side_label, attempt, e)
+        if attempt < 3:
+            time.sleep(1)
+    log.error("  %s SELL failed after 3 attempts — position may be stranded!", side_label)
     return None
 
 
@@ -630,7 +662,7 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
 
     Uses the same limit-order path as the original placement but at
     the current market price rather than the fixed entry price.
-    Retries up to 3 times with 2s delay (matches Rust bot retry logic).
+    Retries up to 3 times with 1s delay (5-min markets need fast execution).
     Returns order ID or None on failure.
     """
     from py_clob_client.order_builder.constants import BUY
@@ -657,7 +689,7 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
         except Exception as e:
             log.warning("  HEDGE %s order failed (attempt %d/3): %s", side_label, attempt, e)
         if attempt < 3:
-            time.sleep(2)
+            time.sleep(1)
     log.error("  HEDGE %s order failed after 3 attempts", side_label)
     return None
 
@@ -722,7 +754,8 @@ async def check_hedge_trailing(
             # ── Step 1b: On-chain verification ─────────────────────────────
             filled_token_id = up_token if hedge_side == "dn" else dn_token
             if ONCHAIN_VERIFY and redeemer:
-                onchain_bal = verify_onchain_balance(redeemer, filled_token_id)
+                # Run in thread so the RPC call never stalls the event loop.
+                onchain_bal = await asyncio.to_thread(verify_onchain_balance, redeemer, filled_token_id)
                 if onchain_bal == 0:
                     # API says filled but on-chain says 0 → ghost fill!
                     log.warning(
@@ -1581,13 +1614,22 @@ async def hedge_loop(
     """Fast 1-second loop for hedge checks + order integrity monitoring.
 
     Runs as a background task so hedge triggers aren't delayed by the
-    5-second main loop sleep.
+    main loop sleep. Logs a heartbeat every 60s so the operator can confirm
+    the loop is alive even when no hedge fires.
     """
+    tick = 0
     while True:
         try:
             await check_hedge_trailing(client, ws_feed, past_markets, redeemer, session_stats)
         except Exception as e:
             log.debug("hedge_loop error: %s", e)
+        tick += 1
+        if tick % 60 == 0:
+            active = sum(
+                1 for i in past_markets.values()
+                if not i.get("redeemed") and not i.get("closed")
+            )
+            log.debug("hedge_loop heartbeat: tick=%d active_markets=%d", tick, active)
         await asyncio.sleep(1)
 
 
@@ -1596,10 +1638,42 @@ async def hedge_loop(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def run():
-    # Set up signal handler for graceful shutdown
-    import signal
+    # Session stats dict must exist before signal_handler closure references it.
+    session_stats: dict = {}
+
     def signal_handler(sig, frame):
-        log.info("\nStopped.")
+        log.info("\nStopped — dumping final session summary...")
+        if session_stats:
+            net = session_stats.get("total_return", 0) - session_stats.get("total_cost", 0)
+            log.info(
+                "  ════ FINAL SESSION SUMMARY ════\n"
+                "    Rounds: %d | Dual fills: %d | Hedged: %d | Bailed: %d | Conv adds: %d\n"
+                "    Skipped (vol/depth/maker): %d/%d/%d\n"
+                "    Total cost: $%.2f | Total return: $%.2f\n"
+                "    Net P&L: $%.2f | Fees: $%.2f",
+                session_stats.get("rounds", 0),
+                session_stats.get("dual_fills", 0),
+                session_stats.get("hedged", 0),
+                session_stats.get("bailed", 0),
+                session_stats.get("conv_adds", 0),
+                session_stats.get("skipped_vol", 0),
+                session_stats.get("skipped_depth", 0),
+                session_stats.get("skipped_maker", 0),
+                session_stats.get("total_cost", 0),
+                session_stats.get("total_return", 0),
+                net,
+                session_stats.get("total_fees", 0),
+            )
+            log_trade(
+                "session_final",
+                rounds=session_stats.get("rounds", 0),
+                dual_fills=session_stats.get("dual_fills", 0),
+                hedged=session_stats.get("hedged", 0),
+                bailed=session_stats.get("bailed", 0),
+                conv_adds=session_stats.get("conv_adds", 0),
+                net_pnl=net,
+                fees=session_stats.get("total_fees", 0),
+            )
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -1638,7 +1712,8 @@ async def run():
     past_markets = {}
 
     # ── Session statistics ─────────────────────────────────────────────────
-    session_stats = {
+    # Use .update() so the signal_handler closure always references the same dict.
+    session_stats.update({
         "rounds": 0,
         "dual_fills": 0,
         "hedged": 0,
@@ -1654,39 +1729,41 @@ async def run():
         "paused_until": 0,
         "current_shares": BASE_SHARES,
         "_blacklist": load_blacklist() if BLACKLIST_ENABLED else set(),
-    }
+    })
 
     # Start fast hedge loop (1s interval) as a background task
     asyncio.create_task(hedge_loop(client, ws_feed, past_markets, redeemer, session_stats))
 
     # ── Scan recent markets (last 2 hours) for unredeemed positions ────────
+    # Fetch all historical slugs in parallel rather than sequentially.
     now = int(time.time())
     log.info("Scanning recent markets for unredeemed positions...")
-    scan_ts = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
-    while scan_ts < now:
-        slug = f"btc-updown-5m-{scan_ts}"
+
+    scan_ts_list = []
+    _s = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
+    while _s < now:
+        scan_ts_list.append(_s)
+        _s += MARKET_PERIOD
+
+    async def _fetch_scan(s_ts: int):
         try:
-            mkt = await get_market_info(slug)
-            past_markets[scan_ts] = {
-                "redeemed": False,
-                "closed": mkt["closed"],
-                "up_token": mkt["up_token"],
-                "dn_token": mkt["dn_token"],
-                "condition_id": mkt["conditionId"],
-                "neg_risk": mkt.get("neg_risk", False),
-                "title": mkt.get("title", slug),
-                "placed_at": 0 if mkt["closed"] else scan_ts,
-            }
-            placed_markets.add(scan_ts)
-            # Subscribe to WS feed so prices are available for active markets
-            if not mkt["closed"]:
-                if not ws_feed.is_connected:
-                    await ws_feed.start([mkt["up_token"], mkt["dn_token"]])
-                else:
-                    await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
+            return s_ts, await get_market_info(f"btc-updown-5m-{s_ts}")
         except Exception:
-            pass
-        scan_ts += MARKET_PERIOD
+            return s_ts, None
+
+    scan_results = await asyncio.gather(*[_fetch_scan(s) for s in scan_ts_list])
+    for s_ts, mkt in scan_results:
+        if mkt is None:
+            continue
+        slug = f"btc-updown-5m-{s_ts}"
+        placed_at = 0 if mkt["closed"] else s_ts
+        past_markets[s_ts] = _market_entry(mkt, slug, placed_at=placed_at)
+        placed_markets.add(s_ts)
+        if not mkt["closed"]:
+            if not ws_feed.is_connected:
+                await ws_feed.start([mkt["up_token"], mkt["dn_token"]])
+            else:
+                await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
     log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
 
     # Pre-fetch cache for next market
@@ -1758,14 +1835,7 @@ async def run():
             if up_bal > 0 or dn_bal > 0:
                 log.info("  Already have position (UP=%.1f, DN=%.1f) — skipping", up_bal, dn_bal)
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": ts,
-                }
+                past_markets[ts] = _market_entry(mkt, slug, placed_at=ts)
                 continue
 
             # Skip if we already have live orders on this market
@@ -1776,14 +1846,7 @@ async def run():
             if existing:
                 log.info("  Already have %d live order(s) — skipping", len(existing))
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": ts,
-                }
+                past_markets[ts] = _market_entry(mkt, slug, placed_at=ts)
                 continue
 
             # ── Placement window check ─────────────────────────────────────
@@ -1795,14 +1858,7 @@ async def run():
                 )
                 log_trade("window_missed", market_ts=ts, slug=slug, elapsed_s=secs_elapsed)
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": 0,
-                }
+                past_markets[ts] = _market_entry(mkt, slug)
                 continue
 
             # ── Max open markets cap ───────────────────────────────────────
@@ -1821,14 +1877,7 @@ async def run():
                 )
                 log_trade("session_loss_skip", market_ts=ts, net_pnl=net_pnl, limit=SESSION_LOSS_LIMIT)
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": 0,
-                }
+                past_markets[ts] = _market_entry(mkt, slug)
                 continue
 
             # ── SESSION RISK: consecutive bail pause ───────────────────────
@@ -1880,14 +1929,7 @@ async def run():
                     log_trade("vol_skip_low", market_ts=ts, atr_pct=atr_pct, threshold=VOL_MIN_ATR_PCT)
                     session_stats["skipped_vol"] = session_stats.get("skipped_vol", 0) + 1
                     placed_markets.add(ts)
-                    past_markets[ts] = {
-                        "redeemed": False, "closed": mkt["closed"],
-                        "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                        "condition_id": mkt["conditionId"],
-                        "neg_risk": mkt.get("neg_risk", False),
-                        "title": mkt.get("title", slug),
-                        "placed_at": 0,
-                    }
+                    past_markets[ts] = _market_entry(mkt, slug)
                     continue
                 if atr_pct > VOL_MAX_ATR_PCT:
                     reduced = max(1, int(shares * 0.5))
@@ -1918,14 +1960,7 @@ async def run():
                 )
                 session_stats["skipped_depth"] = session_stats.get("skipped_depth", 0) + 1
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": 0,
-                }
+                past_markets[ts] = _market_entry(mkt, slug)
                 continue
 
             # ── BLACKLIST CHECK ────────────────────────────────────────────
@@ -1954,14 +1989,7 @@ async def run():
                             break
                     if skip_bl:
                         placed_markets.add(ts)
-                        past_markets[ts] = {
-                            "redeemed": False, "closed": mkt["closed"],
-                            "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                            "condition_id": mkt["conditionId"],
-                            "neg_risk": mkt.get("neg_risk", False),
-                            "title": mkt.get("title", slug),
-                            "placed_at": 0,
-                        }
+                        past_markets[ts] = _market_entry(mkt, slug)
                         continue
 
             # ── MAKER-ONLY ORDER PLACEMENT ─────────────────────────────────
@@ -1996,14 +2024,7 @@ async def run():
                 log_trade("maker_skip_both", market_ts=ts, up_ask=up_best_ask, dn_ask=dn_best_ask)
                 session_stats["skipped_maker"] = session_stats.get("skipped_maker", 0) + 1
                 placed_markets.add(ts)
-                past_markets[ts] = {
-                    "redeemed": False, "closed": mkt["closed"],
-                    "up_token": mkt["up_token"], "dn_token": mkt["dn_token"],
-                    "condition_id": mkt["conditionId"],
-                    "neg_risk": mkt.get("neg_risk", False),
-                    "title": mkt.get("title", slug),
-                    "placed_at": 0,
-                }
+                past_markets[ts] = _market_entry(mkt, slug)
                 continue
 
             # ── Place orders (parallel when both sides active) ─────────────
@@ -2035,24 +2056,17 @@ async def run():
             session_stats["rounds"] = session_stats.get("rounds", 0) + 1
 
             placed_markets.add(ts)
-            past_markets[ts] = {
-                "redeemed": False,
-                "closed": mkt["closed"],
-                "up_token": mkt["up_token"],
-                "dn_token": mkt["dn_token"],
-                "condition_id": mkt["conditionId"],
-                "neg_risk": mkt.get("neg_risk", False),
-                "title": mkt.get("title", slug),
-                "placed_at": ts,
-                "up_order_id": up_id,
-                "dn_order_id": dn_id,
-                "up_price": up_price,
-                "dn_price": dn_price,
-                "shares": shares,
+            past_markets[ts] = _market_entry(
+                mkt, slug, placed_at=ts,
+                up_order_id=up_id,
+                dn_order_id=dn_id,
+                up_price=up_price,
+                dn_price=dn_price,
+                shares=shares,
                 # BTC spot price at placement — used by conviction add to measure
                 # directional move before attempting to increase exposure.
-                "btc_at_place": vol_cache.get("data", {}).get("last_price", 0),
-            }
+                btc_at_place=vol_cache.get("data", {}).get("last_price", 0),
+            )
 
         # ── Log WS prices for active markets ───────────────────────────────
         for ts, info in past_markets.items():
