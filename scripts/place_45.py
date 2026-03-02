@@ -2208,6 +2208,14 @@ async def run():
             max_cost = shares * ((up_price or 0) + (dn_price or 0))
             log.info("  Done: %d orders placed. Max cost: $%.2f (shares=%d)", placed, max_cost, shares)
             log.info("")
+
+            if placed == 0:
+                # All order attempts failed (e.g. CLOB not yet accepting pre-market orders).
+                # Do NOT mark as placed — let the bot retry on the next loop tick.
+                log.warning("  Both orders failed for %s — will retry next tick", slug)
+                log_trade("orders_failed", market_ts=ts, slug=slug, elapsed_s=now - ts)
+                continue
+
             log_trade(
                 "orders_placed", market_ts=ts, slug=slug,
                 title=mkt.get("title", slug),
