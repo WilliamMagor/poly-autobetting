@@ -34,8 +34,21 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 
 import httpx
+
+try:
+    from rich import box as _rbox
+    from rich.layout import Layout as _Layout
+    from rich.live import Live as _Live
+    from rich.panel import Panel as _Panel
+    from rich.table import Table as _Table
+    from rich.text import Text as _Text
+    _RICH = True
+except ImportError:
+    _RICH = False
+    _rbox = _Layout = _Live = _Panel = _Table = _Text = None
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,15 +70,39 @@ log = logging.getLogger("place45")
 # Designed for Claude Code to analyze and surface algo improvements.
 _trade_log = None  # file handle, opened in run()
 
+# Ring buffer of recent events shown in the live dashboard (newest first).
+_dashboard_events: deque = deque(maxlen=18)
+_DASH_EVENTS = {
+    "orders_placed", "fill_detected", "hedge_trigger", "hedge_buy",
+    "bail_execute", "merge", "redeem", "conviction_add_placed",
+    "ghost_fill", "bail_pause", "session_loss_skip", "stale_cancel",
+    "vol_skip_low", "depth_skip", "maker_skip_both", "window_missed",
+}
+
 def open_trade_log():
-    """Open (or create) today's JSONL trade log. Called once at startup."""
+    """Open (or create) today's JSONL trade log. Called once at startup.
+
+    When rich is available, also redirects Python logging to a .log text file
+    so the terminal is left clean for the live dashboard.
+    """
     global _trade_log
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
     os.makedirs(log_dir, exist_ok=True)
     date_str = time.strftime("%Y%m%d")
     path = os.path.join(log_dir, f"place_45_{date_str}.jsonl")
     _trade_log = open(path, "a", buffering=1)  # line-buffered
-    log.info("Trade log: %s", path)
+
+    if _RICH:
+        # Redirect all log.* output to a text file — the rich dashboard takes over the terminal.
+        text_path = os.path.join(log_dir, f"place_45_{date_str}.log")
+        fh = logging.FileHandler(text_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.addHandler(fh)
+        log.info("Dashboard mode active — console logs → %s", text_path)
+    else:
+        log.info("Trade log: %s", path)
 
 def log_trade(event: str, **fields):
     """Append one structured event to today's JSONL trade log."""
@@ -73,6 +110,8 @@ def log_trade(event: str, **fields):
         return
     record = {"ts": int(time.time()), "event": event, **fields}
     _trade_log.write(json.dumps(record) + "\n")
+    if _RICH and event in _DASH_EVENTS:
+        _dashboard_events.appendleft(record)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -175,7 +214,7 @@ GAS_CEILING_GWEI = float(os.getenv("PLACE_45_GAS_CEIL", "100.0"))
 
 # --- Stale cancel & placement window ---
 STALE_CANCEL_BEFORE_END_S = int(os.getenv("PLACE_45_STALE_CANCEL", "60"))
-NEW_MARKET_PLACE_WINDOW_SECONDS = 15
+NEW_MARKET_PLACE_WINDOW_SECONDS = 60  # skip if market started > 60s ago (long merges can delay the loop)
 
 # --- Infrastructure ---
 GAMMA_URL = "https://gamma-api.polymarket.com"
@@ -1628,6 +1667,126 @@ async def hedge_loop(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# LIVE DASHBOARD — rendered when `rich` is installed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_EV_FMT = {
+    "orders_placed":         ("ORDER",   lambda e: f"UP+DN {e.get('sides_placed',0)} side(s) @ {e.get('up_price') or e.get('dn_price',0):.2f}"),
+    "fill_detected":         ("FILL",    lambda e: f"{e.get('filled_side','?')} filled → hold {e.get('hedge_side','').upper()}"),
+    "hedge_trigger":         ("HEDGE",   lambda e: f"{e.get('hedge_side','?').upper()} ask={e.get('ask',0):.3f}  EV=+${e.get('ev',0):.3f}  [{e.get('reason','')}]"),
+    "hedge_buy":             ("HEDGED",  lambda e: f"{e.get('side','?')} @ {e.get('price',0):.3f} × {e.get('shares',0):.0f}sh"),
+    "bail_execute":          ("BAIL",    lambda e: f"{e.get('side','?')} @ {e.get('sell_bid',0):.3f}  pnl=${e.get('bail_pnl',0):.2f}"),
+    "merge":                 ("MERGE",   lambda e: f"{e.get('sets',0):.1f} sets  {'✓' if e.get('ok') else '✗ FAILED'}"),
+    "redeem":                ("REDEEM",  lambda e: f"UP={e.get('up_bal',0):.1f} DN={e.get('dn_bal',0):.1f}  {'✓' if e.get('ok') else '✗'}"),
+    "conviction_add_placed": ("CONV+",   lambda e: f"{e.get('side','?')} +{e.get('add_shares',0)}sh @ {e.get('ask',0):.3f}"),
+    "ghost_fill":            ("GHOST!",  lambda e: f"{e.get('filled_side','?')} api={e.get('api_bal',0):.1f} chain=0"),
+    "bail_pause":            ("PAUSE",   lambda e: f"{e.get('consecutive',0)} bails → {e.get('pause_s',0)//60}min"),
+    "session_loss_skip":     ("LOSS LIM",lambda e: f"net=${e.get('net_pnl',0):.2f}"),
+    "stale_cancel":          ("STALE",   lambda e: f"no fill at {e.get('elapsed_s',0)}s"),
+    "vol_skip_low":          ("VOL",     lambda e: f"ATR={e.get('atr_pct',0):.3f}% too quiet"),
+    "depth_skip":            ("DEPTH",   lambda e: "book too thin"),
+    "maker_skip_both":       ("MAKER",   lambda e: "both sides crossed"),
+    "window_missed":         ("MISSED",  lambda e: f"discovered {e.get('elapsed_s',0)}s late"),
+}
+_EV_COLORS = {
+    "ORDER": "cyan", "FILL": "yellow", "HEDGE": "bright_yellow",
+    "HEDGED": "green", "BAIL": "red", "MERGE": "green", "REDEEM": "green",
+    "CONV+": "magenta", "GHOST!": "bright_red bold", "PAUSE": "red",
+    "LOSS LIM": "bright_red", "STALE": "dim", "VOL": "dim",
+    "DEPTH": "dim", "MAKER": "dim", "MISSED": "dim",
+}
+
+def _render_dashboard(session_stats: dict, past_markets: dict) -> "_Layout":
+    """Build the rich Layout for the live terminal dashboard."""
+    layout = _Layout()
+    layout.split_column(
+        _Layout(name="header", size=3),
+        _Layout(name="body"),
+        _Layout(name="footer", size=1),
+    )
+    layout["body"].split_row(
+        _Layout(name="stats", ratio=1),
+        _Layout(name="events", ratio=2),
+    )
+
+    pnl = session_stats.get("total_return", 0) - session_stats.get("total_cost", 0)
+    pnl_style = "bold green" if pnl >= 0 else "bold red"
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = _Text(justify="center")
+    hdr.append("POLY-AUTOBETTER  ", style="bold cyan")
+    hdr.append("BTC 5-min Up/Down  ", style="dim white")
+    hdr.append("Net P&L: ", style="bold white")
+    hdr.append(f"${pnl:+.2f}", style=pnl_style)
+    layout["header"].update(_Panel(hdr, box=_rbox.HORIZONTALS, border_style="blue"))
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    tbl = _Table(box=None, show_header=False, padding=(0, 1))
+    tbl.add_column("k", style="dim", width=14)
+    tbl.add_column("v")
+
+    def _row(k, v, style="bold white"):
+        tbl.add_row(k, _Text(str(v), style=style))
+
+    _row("Rounds",     session_stats.get("rounds", 0))
+    _row("Net P&L",    f"${pnl:+.2f}", pnl_style)
+    _row("Fees",       f"${session_stats.get('total_fees', 0):.3f}", "dim")
+    tbl.add_row("", "")
+    _row("Dual fills", session_stats.get("dual_fills", 0),  "green")
+    _row("Hedged",     session_stats.get("hedged", 0),      "yellow")
+    _row("Bailed",     session_stats.get("bailed", 0),      "red")
+    _row("Conv adds",  session_stats.get("conv_adds", 0),   "magenta")
+    tbl.add_row("", "")
+    _row("Skip vol",   session_stats.get("skipped_vol", 0),   "dim")
+    _row("Skip depth", session_stats.get("skipped_depth", 0), "dim")
+    _row("Skip maker", session_stats.get("skipped_maker", 0), "dim")
+
+    # Recent markets
+    now = int(time.time())
+    active = [(mts, i) for mts, i in past_markets.items() if not i.get("redeemed")]
+    if active:
+        tbl.add_row("", "")
+        tbl.add_row(_Text("MARKETS", style="dim"), "")
+        for mts, info in sorted(active)[-6:]:
+            if info.get("hedge_done"):    status, sty = "HEDGED",  "green"
+            elif info.get("bailed"):      status, sty = "BAILED",  "red"
+            elif info.get("closed"):      status, sty = "CLOSED",  "dim"
+            elif info.get("hedge_side"):  status, sty = f"HOLD {info['hedge_side'].upper()}", "yellow"
+            elif info.get("placed_at"):   status, sty = "OPEN",    "cyan"
+            else:                         status, sty = "–",        "dim"
+            elapsed = now - info.get("placed_at", now) if info.get("placed_at") else 0
+            t = time.strftime("%H:%M", time.localtime(mts))
+            tbl.add_row(f"  {t}", _Text(f"{status} +{elapsed}s", style=f"bold {sty}"))
+
+    layout["stats"].update(_Panel(tbl, title="[bold]SESSION[/bold]", border_style="blue"))
+
+    # ── Events ────────────────────────────────────────────────────────────────
+    ev_tbl = _Table(box=_rbox.SIMPLE, show_header=True, padding=(0, 1), expand=True)
+    ev_tbl.add_column("Time",   style="dim", width=8)
+    ev_tbl.add_column("Event",               width=9)
+    ev_tbl.add_column("Detail")
+
+    for ev in list(_dashboard_events):
+        event = ev.get("event", "")
+        ts = ev.get("ts", 0)
+        t = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "?"
+        label, fn = _EV_FMT.get(event, (event, lambda e: ""))
+        detail = fn(ev)
+        color = _EV_COLORS.get(label, "white")
+        ev_tbl.add_row(t, _Text(label, style=f"bold {color}"), detail)
+
+    layout["events"].update(_Panel(ev_tbl, title="[bold]EVENTS[/bold]", border_style="blue"))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    log_name = os.path.basename(_trade_log.name) if _trade_log else "no log"
+    layout["footer"].update(_Text(
+        f"  {log_name}   {time.strftime('%H:%M:%S')}   Ctrl+C to stop",
+        style="dim",
+    ))
+    return layout
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1776,7 +1935,17 @@ async def run():
     # Cache volatility across rounds (refresh every 60s)
     vol_cache = {"data": None, "fetched_at": 0}
 
-    while True:
+    # ── Live dashboard (replaces console output when rich is installed) ────────
+    _live = _Live(
+        _render_dashboard(session_stats, past_markets),
+        refresh_per_second=2,
+        screen=True,
+    ) if _RICH else None
+    if _live:
+        _live.start()
+
+    try:
+     while True:
         now = int(time.time())
         timestamps = next_market_timestamps(now)
         next_market_ts = (now // MARKET_PERIOD) * MARKET_PERIOD + MARKET_PERIOD
@@ -2077,7 +2246,7 @@ async def run():
                     hedge_state = " [HEDGED]"
                 elif info.get("hedge_side"):
                     hedge_state = f" [TRAILING {info['hedge_side'].upper()}]"
-                log.info(
+                log.debug(
                     "  [%d +%ds] WS: UP=%.2f  DN=%.2f%s",
                     ts, elapsed, up_ask or 0, dn_ask or 0, hedge_state,
                 )
@@ -2123,20 +2292,26 @@ async def run():
                 net_pnl=net, fees=session_stats.get("total_fees", 0),
             )
 
-        # ── Sleep / prefetch ───────────────────────────────────────────────
+        # ── Sleep / prefetch / dashboard ──────────────────────────────────
         seconds_until = next_market_ts - now
         sleep_s = 0.5 if seconds_until <= 15 else (1 if seconds_until <= 60 else 2)
         if seconds_until <= NEXT_MARKET_PREFETCH_SEC and seconds_until > 0:
             asyncio.create_task(prefetch_next_market(next_market_ts, next_market_cache))
+        if _live:
+            _live.update(_render_dashboard(session_stats, past_markets))
         await asyncio.sleep(sleep_s)
 
-        log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
+        log.debug("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
         # ── Prune old entries ──────────────────────────────────────────────
         stale = [ts for ts in past_markets if ts <= now - 7200]
         for ts in stale:
             del past_markets[ts]
         placed_markets = {ts for ts in placed_markets if ts > now - 2 * MARKET_PERIOD}
+
+    finally:
+        if _live:
+            _live.stop()
 
 
 if __name__ == "__main__":
