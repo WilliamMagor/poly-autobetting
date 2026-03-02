@@ -2103,28 +2103,14 @@ async def run():
                     log_trade("vol_reduce", market_ts=ts, atr_pct=atr_pct, shares_before=shares, shares_after=reduced)
                     shares = reduced
 
-            # ── LIQUIDITY FILTER ───────────────────────────────────────────
+            # ── BOOK SNAPSHOT (needed for maker-price adjustment below) ───────
+            # Depth check removed: as a maker strategy, thin book just means slower
+            # fills — it doesn't hurt us. Bail logic has its own depth check at
+            # bail time (BAIL_MIN_BID_DEPTH) which is the only place it matters.
             up_depth_info, dn_depth_info = await asyncio.gather(
-                asyncio.to_thread(check_book_depth, client, mkt["up_token"], PRICE, MIN_BOOK_DEPTH),
-                asyncio.to_thread(check_book_depth, client, mkt["dn_token"], PRICE, MIN_BOOK_DEPTH),
+                asyncio.to_thread(check_book_depth, client, mkt["up_token"], PRICE, 0),
+                asyncio.to_thread(check_book_depth, client, mkt["dn_token"], PRICE, 0),
             )
-            if not up_depth_info["sufficient"] or not dn_depth_info["sufficient"]:
-                log.info(
-                    "  DEPTH SKIP: UP ask_d=%.0f bid_d=%.0f, DN ask_d=%.0f bid_d=%.0f "
-                    "(min=%.0f)",
-                    up_depth_info["ask_depth"], up_depth_info["bid_depth"],
-                    dn_depth_info["ask_depth"], dn_depth_info["bid_depth"],
-                    MIN_BOOK_DEPTH,
-                )
-                log_trade(
-                    "depth_skip", market_ts=ts,
-                    up_ask_d=up_depth_info["ask_depth"], up_bid_d=up_depth_info["bid_depth"],
-                    dn_ask_d=dn_depth_info["ask_depth"], dn_bid_d=dn_depth_info["bid_depth"],
-                )
-                session_stats["skipped_depth"] = session_stats.get("skipped_depth", 0) + 1
-                placed_markets.add(ts)
-                past_markets[ts] = _market_entry(mkt, slug)
-                continue
 
             # ── BLACKLIST CHECK ────────────────────────────────────────────
             if BLACKLIST_ENABLED:
