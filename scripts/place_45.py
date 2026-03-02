@@ -1382,12 +1382,6 @@ async def try_merge_all(client, redeemer, past_markets: dict, session_stats: dic
     if not redeemer:
         return
 
-    # Gas ceiling check for non-urgent merge
-    gas_gwei = get_polygon_gas_gwei(redeemer)
-    if gas_gwei > GAS_CEILING_GWEI:
-        log.info("  Merge deferred: gas %.0f gwei > ceiling %.0f", gas_gwei, GAS_CEILING_GWEI)
-        return
-
     merged = []
     for ts, info in list(past_markets.items()):
         if info.get("redeemed"):
