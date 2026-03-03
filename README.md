@@ -1,15 +1,16 @@
 # poly-autobetting
 
-Automated trading bot for Polymarket BTC 5-minute prediction markets. Places 45c limit orders on both UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions via gasless relayer.
+Automated trading bot for Polymarket BTC 15-minute prediction markets. Places configurable limit orders on both UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions on-chain.
 
 ## How It Works
 
-The bot targets BTC 5-minute up/down binary markets on Polymarket. It places 45c buy limit orders on both sides (UP and DOWN) for each market. When both sides fill, the combined cost is $0.90 for a guaranteed $1.00 payout — netting $0.10 profit per round. It automatically rotates to new markets every 5 minutes.
+The bot targets BTC 15-minute up/down binary markets on Polymarket. It places limit buy orders on both sides (UP and DOWN) for each market at a configurable entry price (default 46c). When both sides fill, the combined cost is < $1.00 for a guaranteed $1.00 payout. It automatically rotates to new markets every 15 minutes.
 
-- **Dual-Side 45c Orders** — places limit buys on both UP and DOWN at 45c each
-- **Auto-Rotation** — detects and places orders on upcoming 5-minute markets
+- **Dual-Side Limit Orders** — places limit buys on both UP and DOWN at configurable entry price
+- **Auto-Rotation** — detects and places orders on upcoming 15-minute markets (900s window)
 - **WebSocket Price Feed** — real-time order book monitoring with auto-reconnect
-- **Auto-Redeem** — redeems resolved positions via Polymarket's gasless builder relayer
+- **EV-Based Hedge/Bail** — time-phased trailing hedge and EV-based bail schedule
+- **Auto-Redeem** — redeems resolved positions via direct on-chain Polygon transaction
 
 ## Project Structure
 
@@ -86,7 +87,7 @@ source venv/bin/activate
 python scripts/place_45.py
 ```
 
-The bot will place 45c limit orders on both UP and DOWN for the current and upcoming BTC 15-minute markets, then loop every 10 seconds to check for new markets and redeem resolved positions.
+The bot will place limit orders on both UP and DOWN for the current and upcoming BTC 15-minute markets, then loop to check for new markets, manage hedges/bails, and redeem resolved positions.
 
 ## Disclaimer
 
