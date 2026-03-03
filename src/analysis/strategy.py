@@ -61,11 +61,11 @@ def find_arbitrage_pairs(trades: list[MarketTrade]) -> list[MarketPair]:
         if not up_buys or not down_buys:
             continue
 
-        # Match trades by time proximity (within 5 minutes)
+        # Match trades by time proximity (within 15 minutes)
         for up in up_buys:
             for down in down_buys:
                 time_diff = abs((up.timestamp - down.timestamp).total_seconds())
-                if time_diff < 300:  # 5 minutes
+                if time_diff < 900:  # 15 minutes
                     # Calculate P&L
                     pnl = calculate_arbitrage_pnl(
                         up_price=up.price,
