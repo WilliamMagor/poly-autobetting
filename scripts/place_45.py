@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import httpx
@@ -48,7 +49,6 @@ from src.bot.ws_book_feed import WSBookFeed
 from src.bot.math_engine import FeeParams, taker_fee_usdc, effective_fee_rate
 from src.bot.types import PositionState
 from src.bot.fill_monitor import FillDeduplicator
-from src.bot.risk_engine import RiskLimits, RiskEngine as _RiskEngine
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
@@ -188,14 +188,6 @@ HEARTBEAT_INTERVAL_S = int(_env("PLACE_15_HEARTBEAT_INTERVAL_S", "", "5"))
 # BTC crypto markets: feeRate=0.25, exponent=2. Max effective rate ~1.56% at 50c.
 # Maker orders (our limit buys) pay ZERO fee — only taker hedges incur fees.
 _FEE_PARAMS = FeeParams.for_crypto()
-
-# --- Risk limits for circuit breakers ---
-_RISK_LIMITS = RiskLimits(
-    max_vwap_ratio=1.02,    # cancel all when combined VWAP >= 1.02
-    max_vwap_shares=200.0,  # ...at 200+ total shares
-    max_imbalance_ratio=0.15,  # cancel all when one-sided at 15%+
-    max_imbalance_shares=100.0,  # ...at 100+ total shares
-)
 
 # --- Fill deduplicator (crash-safe, persisted between restarts) ---
 _FILL_DEDUP: FillDeduplicator | None = None  # initialized in run()
@@ -571,36 +563,71 @@ def place_order(client, token_id: str, side_label: str, shares: float, price: fl
     return None
 
 
-def sell_at_bid(client, token_id: str, shares: float, side_label: str) -> str | None:
-    """Place a limit SELL at the current best bid. Returns order ID or None."""
+def sell_at_bid(client, token_id: str, shares: float, side_label: str,
+                max_attempts: int = 3, check_interval: float = 2.0) -> str | None:
+    """Place a limit SELL at the current best bid, with retry if unfilled.
+
+    After placing, waits check_interval seconds and checks if the order is
+    still LIVE. If so, cancels and re-places at the new best bid. Repeats
+    up to max_attempts times to handle bid movement.
+    """
     from py_clob_client.order_builder.constants import SELL
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    try:
-        book = client.get_order_book(token_id)
-        if not book.bids:
-            log.warning("  %s no bids to sell into", side_label)
-            return None
-        best_bid = float(book.bids[0].price)
-        log.info("  %s SELL %.0f @ %.2f (best bid)", side_label, shares, best_bid)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            book = client.get_order_book(token_id)
+            if not book.bids:
+                log.warning("  %s no bids to sell into", side_label)
+                return None
+            best_bid = float(book.bids[0].price)
+            log.info("  %s SELL %.0f @ %.2f (best bid, attempt %d/%d)",
+                     side_label, shares, best_bid, attempt, max_attempts)
 
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=best_bid,
-            size=round(shares, 1),
-            side=SELL,
-            expiration=int(time.time()) + WINDOW_S,  # expire with market
-        )
-        signed = client.create_order(order_args)
-        result = client.post_order(signed, OrderType.GTD)
-        oid = result.get("orderID", result.get("id", ""))
-        if oid:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=best_bid,
+                size=round(shares, 1),
+                side=SELL,
+                expiration=int(time.time()) + WINDOW_S,
+            )
+            signed = client.create_order(order_args)
+            result = client.post_order(signed, OrderType.GTD)
+            oid = result.get("orderID", result.get("id", ""))
+            if not oid:
+                log.warning("  %s SELL no order ID: %s", side_label, result)
+                continue
+
             log.info("  %s SELL placed [%s]", side_label, oid[:12])
-            return oid
-        else:
-            log.warning("  %s SELL no order ID: %s", side_label, result)
-    except Exception as e:
-        log.error("  %s SELL failed: %s", side_label, e)
+
+            if attempt == max_attempts:
+                return oid
+
+            time.sleep(check_interval)
+
+            try:
+                order_detail = client.get_order(oid)
+                status = str((order_detail or {}).get("status", "")).upper()
+                matched = float((order_detail or {}).get("size_matched", 0))
+                original = float((order_detail or {}).get("original_size", shares))
+                if status != "LIVE" or matched >= original - 0.01:
+                    log.info("  %s SELL filled (status=%s, matched=%.1f)", side_label, status, matched)
+                    return oid
+            except Exception:
+                return oid
+
+            log.info("  %s SELL still unfilled — cancelling to re-place at new bid", side_label)
+            try:
+                client.cancel(oid)
+            except Exception as e:
+                log.warning("  %s SELL cancel failed: %s", side_label, e)
+                return oid
+
+        except Exception as e:
+            log.error("  %s SELL failed (attempt %d/%d): %s", side_label, attempt, max_attempts, e)
+            if attempt < max_attempts:
+                time.sleep(1)
+
     return None
 
 
@@ -1016,6 +1043,59 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
 # ============================================================================
 
 
+class NonceManager:
+    """Thread-safe nonce manager that prevents nonce collisions between
+    back-to-back merge and redeem transactions."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._nonce: int | None = None
+
+    def get_nonce(self, w3, address: str) -> int:
+        with self._lock:
+            on_chain = w3.eth.get_transaction_count(address)
+            if self._nonce is None or on_chain > self._nonce:
+                self._nonce = on_chain
+            nonce = self._nonce
+            self._nonce += 1
+            return nonce
+
+    def reset(self):
+        with self._lock:
+            self._nonce = None
+
+
+_nonce_mgr = NonceManager()
+
+
+def _send_tx(w3, account, tx_fn, gas: int, label: str) -> bool:
+    """Build, sign, send, and wait for an on-chain transaction.
+    Shared by merge_market and redeem_market."""
+    try:
+        nonce = _nonce_mgr.get_nonce(w3, account.address)
+        tx = tx_fn.build_transaction({
+            "from": account.address,
+            "nonce": nonce,
+            "gas": gas,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 137,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("  %s tx sent: %s", label, tx_hash.hex()[:20])
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] == 1:
+            log.info("  %s CONFIRMED: %s", label, tx_hash.hex()[:20])
+            return True
+        log.error("  %s tx FAILED (status=0): %s", label, tx_hash.hex()[:20])
+        _nonce_mgr.reset()
+        return False
+    except Exception as e:
+        log.error("  %s error: %s", label, e)
+        _nonce_mgr.reset()
+        return False
+
+
 def merge_market(redeemer, condition_id: str, amount: float) -> bool:
     """Merge complete sets (1 UP + 1 DN) into USDC on-chain. Can be done before or after resolution.
     amount = number of full sets to merge (min of UP and DN balances). Returns True on success."""
@@ -1038,27 +1118,7 @@ def merge_market(redeemer, condition_id: str, amount: float) -> bool:
     tx_fn = contract.functions.mergePositions(
         Web3.to_checksum_address(USDC_ADDRESS), b"\x00" * 32, cond_bytes, [1, 2], amount_wei
     )
-    try:
-        nonce = w3.eth.get_transaction_count(account.address)
-        tx = tx_fn.build_transaction({
-            "from": account.address,
-            "nonce": nonce,
-            "gas": 200_000,
-            "gasPrice": w3.eth.gas_price,
-            "chainId": 137,
-        })
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("  Merge tx sent: %s (%s sets)", tx_hash.hex()[:20], amount)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] == 1:
-            log.info("  Merge CONFIRMED: %s", tx_hash.hex()[:20])
-            return True
-        log.error("  Merge tx FAILED (status=0): %s", tx_hash.hex()[:20])
-        return False
-    except Exception as e:
-        log.error("  Merge error: %s", e)
-        return False
+    return _send_tx(w3, account, tx_fn, 200_000, "Merge")
 
 
 def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0.0, dn_bal: float = 0.0) -> bool:
@@ -1089,28 +1149,7 @@ def redeem_market(redeemer, condition_id: str, neg_risk: bool, up_bal: float = 0
             Web3.to_checksum_address(USDC_ADDRESS), b"\x00" * 32, cond_bytes, [1, 2]
         )
 
-    try:
-        nonce = w3.eth.get_transaction_count(account.address)
-        tx = tx_fn.build_transaction({
-            "from": account.address,
-            "nonce": nonce,
-            "gas": 300_000,
-            "gasPrice": w3.eth.gas_price,
-            "chainId": 137,
-        })
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("  Redeem tx sent: %s", tx_hash.hex()[:20])
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] == 1:
-            log.info("  Redeem CONFIRMED: %s", tx_hash.hex()[:20])
-            return True
-        else:
-            log.error("  Redeem tx FAILED (status=0): %s", tx_hash.hex()[:20])
-            return False
-    except Exception as e:
-        log.error("  Redeem error: %s", e)
-        return False
+    return _send_tx(w3, account, tx_fn, 300_000, "Redeem")
 
 
 
@@ -1228,12 +1267,19 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
             info["redeemed"] = True  # nothing to redeem
             continue
 
+        redeem_fails = info.get("redeem_fails", 0)
+        if redeem_fails >= 5:
+            continue
         log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", title[:50], up_bal, dn_bal)
         ok = await asyncio.to_thread(redeem_market, redeemer, condition_id, neg_risk, up_bal, dn_bal)
         log_trade("redeem", market_ts=ts, title=title, up_bal=up_bal, dn_bal=dn_bal, ok=ok)
         if ok:
             info["redeemed"] = True
             redeemed.append(ts)
+        else:
+            info["redeem_fails"] = redeem_fails + 1
+            if redeem_fails + 1 >= 5:
+                log.warning("  Redeem gave up on %s after 5 failures", title[:50])
 
     if redeemed:
         log.info("  Redeemed %d market(s)", len(redeemed))
@@ -1287,11 +1333,18 @@ async def try_merge_all(client, redeemer, past_markets: dict):
         if merge_amount <= 0:
             continue
 
+        merge_fails = info.get("merge_fails", 0)
+        if merge_fails >= 5:
+            continue
         log.info("  Merging %s (%.1f complete sets)...", title[:50], merge_amount)
         ok = await asyncio.to_thread(merge_market, redeemer, condition_id, merge_amount)
         log_trade("merge", market_ts=ts, title=title, sets=merge_amount, ok=ok)
         if ok:
             merged.append(ts)
+        else:
+            info["merge_fails"] = merge_fails + 1
+            if merge_fails + 1 >= 5:
+                log.warning("  Merge gave up on %s after 5 failures", title[:50])
 
     if merged:
         log.info("  Merged %d market(s)", len(merged))
@@ -1360,6 +1413,8 @@ async def run():
     # Track past markets: {ts: {redeemed, bailed, up_token, dn_token, closed}}
     # NOTE: never reassign this dict — hedge_loop holds a reference to it.
     past_markets = {}
+    MERGE_REDEEM_INTERVAL_S = 30
+    last_merge_redeem_ts = 0
 
     # Start fast hedge loop (1s interval) as a background task
     asyncio.create_task(hedge_loop(client, ws_feed, past_markets))
@@ -1644,12 +1699,20 @@ async def run():
                     _info["stale_cancelled"] = True
                     log_trade("stale_cancel", market_ts=_ts, elapsed_s=now - _placed)
 
+        # WS health check: force reconnect if no messages received in 90s
+        ws_age = ws_feed.last_message_age
+        if ws_age > 90.0 and ws_feed.is_connected:
+            log.warning("WS feed stale (%.0fs since last message) — forcing reconnect", ws_age)
+            await ws_feed.force_reconnect()
+
         # EV-based bail: sell filled side if other side's ask exceeds time-based threshold
         await check_bail_out(client, ws_feed, past_markets)
-        # Merge complete sets (UP+DN) into USDC only after market has ended
-        await try_merge_all(client, redeemer, past_markets)
-        # Redeem resolved markets (remaining winning/losing tokens after resolution)
-        await try_redeem_all(client, redeemer, past_markets)
+        # Merge + redeem are on-chain txs that don't need sub-second latency.
+        # Throttle to every MERGE_REDEEM_INTERVAL_S to reduce API spam.
+        if now - last_merge_redeem_ts >= MERGE_REDEEM_INTERVAL_S:
+            await try_merge_all(client, redeemer, past_markets)
+            await try_redeem_all(client, redeemer, past_markets)
+            last_merge_redeem_ts = now
 
         # Faster poll when close to next market start (better chance to fill both sides)
         seconds_until = next_market_ts - now
@@ -1662,9 +1725,21 @@ async def run():
         # Log status with countdown
         log.info("[Next market in %ds] Checked %d markets", seconds_until, len(timestamps))
 
-        # Clean very old entries (keep last 2 hours for redemption).
-        # Use in-place deletion to preserve the reference held by hedge_loop.
-        stale = [ts for ts in past_markets if ts <= now - 7200]
+        # Clean old entries. Hard TTL of 6 hours — if merge/redeem hasn't
+        # succeeded by then, the market is stuck and needs manual attention.
+        # Standard cleanup at 2h for markets that are fully redeemed.
+        HARD_TTL_S = 21600  # 6 hours
+        NORMAL_TTL_S = 7200  # 2 hours
+        stale = []
+        for ts, info in past_markets.items():
+            age = now - ts
+            if age > HARD_TTL_S:
+                if not info.get("redeemed"):
+                    log.warning("  Hard TTL: dropping market %d after %ds (unredeemed)", ts, age)
+                    log_trade("hard_ttl_drop", market_ts=ts, age_s=age)
+                stale.append(ts)
+            elif age > NORMAL_TTL_S and info.get("redeemed"):
+                stale.append(ts)
         for ts in stale:
             del past_markets[ts]
         # placed_markets must survive long enough to cover the previous period

@@ -47,10 +47,18 @@ class WSBookFeed:
         self._stop_event = asyncio.Event()
         self._connected = asyncio.Event()
         self._backoff_s = 1.0
+        self._last_msg_ts: float = 0.0
 
     @property
     def is_connected(self) -> bool:
         return self._connected.is_set()
+
+    @property
+    def last_message_age(self) -> float:
+        """Seconds since last WS message was received. 0 if never connected."""
+        if self._last_msg_ts == 0.0:
+            return 0.0
+        return time.time() - self._last_msg_ts
 
     def get_book(self, token_id: str) -> Optional[Dict]:
         """Get cached order book for a token. Returns None if no data."""
@@ -104,6 +112,17 @@ class WSBookFeed:
         if self._ws is not None:
             await self._send_subscribe(new_ids)
 
+    async def force_reconnect(self) -> None:
+        """Force-close current WS and let _run_loop reconnect automatically."""
+        logger.warning("WS force_reconnect requested")
+        self._connected.clear()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
     async def close(self) -> None:
         """Stop the WS feed."""
         self._stop_event.set()
@@ -148,11 +167,11 @@ class WSBookFeed:
                         await self._send_subscribe(self._token_ids)
 
                     # Listen for messages
-                    last_msg_ts = time.time()
+                    self._last_msg_ts = time.time()
                     async for raw in ws:
                         if self._stop_event.is_set():
                             break
-                        last_msg_ts = time.time()
+                        self._last_msg_ts = time.time()
                         try:
                             msg = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
                             self._handle_message(msg)

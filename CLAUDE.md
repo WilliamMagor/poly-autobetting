@@ -12,9 +12,8 @@ Rotates to new markets every 15 minutes, 24/7.
 
 ## The One File That Matters
 
-**`scripts/place_45.py`** — the entire bot. ~1350 lines, single file.
+**`scripts/place_45.py`** — the entire bot. ~1800 lines, single file.
 This is the only file you need to read/edit for normal operation.
-It imports only `WSBookFeed` from `src/bot/ws_book_feed.py`.
 
 ### place_45.py Section Map (line numbers are approximate)
 
@@ -71,7 +70,7 @@ See `.env.example` for full list.
 | `src/bot/math_engine.py` | Fee calculation (FeeParams, taker_fee_usdc) — imported by place_45.py |
 | `src/bot/types.py` | Data types (PositionState, FillEvent, etc.) — imported by place_45.py |
 | `src/bot/fill_monitor.py` | FillDeduplicator for crash-safe fill tracking — imported by place_45.py |
-| `src/bot/risk_engine.py` | RiskLimits circuit breakers — imported by place_45.py |
+| `scripts/monitor.py` | Live terminal dashboard (reads trade logs, not imported by bot) |
 | `src/analysis/calculator.py` | P&L calculator (standalone analysis tool) |
 
 ## Running the Bot
