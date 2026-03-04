@@ -68,6 +68,10 @@ See `.env.example` for full list.
 | File | What |
 |------|------|
 | `src/bot/ws_book_feed.py` | WebSocket orderbook feed (imported by place_45.py) |
+| `src/bot/math_engine.py` | Fee calculation (FeeParams, taker_fee_usdc) — imported by place_45.py |
+| `src/bot/types.py` | Data types (PositionState, FillEvent, etc.) — imported by place_45.py |
+| `src/bot/fill_monitor.py` | FillDeduplicator for crash-safe fill tracking — imported by place_45.py |
+| `src/bot/risk_engine.py` | RiskLimits circuit breakers — imported by place_45.py |
 | `src/analysis/calculator.py` | P&L calculator (standalone analysis tool) |
 
 ## Running the Bot
