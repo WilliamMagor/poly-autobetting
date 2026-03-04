@@ -1532,6 +1532,10 @@ async def run():
                       up_id=up_id, dn_id=dn_id, sides_placed=placed,
                       elapsed_s=now - ts, dynamic=ENTRY_PRICE_DYNAMIC)
 
+            if placed == 0:
+                log.info("  Both orders returned null — market may not be open yet. Will retry next loop.")
+                continue
+
             placed_markets.add(ts)
             past_markets[ts] = {
                 "redeemed": False,
