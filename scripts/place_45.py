@@ -323,8 +323,10 @@ async def _fallback_market_scan(ts: int) -> dict | None:
         if not (is_btc and is_15m):
             continue
 
-        # Validate duration matches WINDOW_S (~900s)
-        start_date = m.get("startDate") or m.get("start_date_iso") or ""
+        # Validate duration matches WINDOW_S (~900s).
+        # IMPORTANT: use eventStartTime (actual 15-min window open), NOT startDate
+        # which is the event CREATION date (days ago → gives 800000s "duration").
+        start_date = m.get("eventStartTime") or m.get("startDate") or m.get("start_date_iso") or ""
         end_date = m.get("endDate") or m.get("end_date_iso") or ""
         if not start_date or not end_date:
             continue
@@ -335,8 +337,10 @@ async def _fallback_market_scan(ts: int) -> dict | None:
             continue
         duration = t_end - t_start
         if abs(duration - WINDOW_S) > 60:
+            log.debug("Fallback skip: duration=%.0fs (expected %ds) for %s", duration, WINDOW_S, mslug)
             continue  # not a 15-min market
         if abs(int(t_start) - ts) > 60:
+            log.debug("Fallback skip: slot mismatch t_start=%d expected ts=%d for %s", int(t_start), ts, mslug)
             continue  # doesn't match expected time slot
 
         result = _parse_gamma_market(m)
@@ -403,8 +407,11 @@ async def get_market_info(slug: str) -> dict:
         condition_id = _validate_condition_id(condition_id)
 
     # --- Duration sanity check (must be ~900s for 15-minute markets) ---
+    # IMPORTANT: use eventStartTime (actual 15-min window open), NOT startDate.
+    # startDate = event creation date (days/weeks ago) → endDate - startDate ≈ 800000s.
+    # eventStartTime = when THIS 15-min window opened → endDate - eventStartTime ≈ 900s.
     end_date = m.get("endDate") or m.get("end_date_iso") or ""
-    start_date = m.get("startDate") or m.get("start_date_iso") or ""
+    start_date = m.get("eventStartTime") or m.get("startDate") or m.get("start_date_iso") or ""
     if end_date and start_date:
         from datetime import datetime
         try:
