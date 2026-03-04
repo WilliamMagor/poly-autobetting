@@ -65,41 +65,10 @@ See `.env.example` for full list.
 
 ## Supporting Files
 
-| File | Used? | What |
-|------|-------|------|
-| `src/bot/ws_book_feed.py` | **YES** | WebSocket orderbook feed (imported by place_45.py) |
-| `src/config.py` | no | Fee constants (place_45.py has its own) |
-| `src/analysis/calculator.py` | no | P&L calculator (standalone analysis tool) |
-
-## Dead Code (not imported by anything)
-
-These exist for reference/analysis but are NOT used by the bot:
-
-| File | What It Was |
-|------|-------------|
-| `src/bot/runner.py` (5000 lines!) | Separate bot framework (penny ladder strategies) |
-| `src/bot/client.py` | Exchange adapter (not used by place_45.py) |
-| `src/bot/order_engine.py` | Ladder builder (not used by place_45.py) |
-| `src/bot/risk_engine.py` | Circuit breakers (not used by place_45.py) |
-| `src/bot/fill_monitor.py` | Fill detection (not used by place_45.py) |
-| `src/bot/position_tracker.py` | Position tracking (not used by place_45.py) |
-| `src/bot/market_scheduler.py` | Market discovery (not used by place_45.py) |
-| `src/bot/session_loop.py` | Session primitives (not used by place_45.py) |
-| `src/bot/rebalance.py` | Imbalance logic (not used by place_45.py) |
-| `src/bot/state_manager.py` | State persistence (not used by place_45.py) |
-| `src/bot/math_engine.py` | Math formulas (not used by place_45.py) |
-| `src/bot/alerts.py` | Telegram alerts (not used by place_45.py) |
-| `src/bot/backtest.py` | Backtesting (not used by place_45.py) |
-| `src/bot/bot_config.py` | Config loader (not used by place_45.py) |
-| `src/bot/types.py` | Data structures (not used by place_45.py) |
-| `src/api/data_api.py` | User trade history (unused) |
-| `src/api/polygonscan.py` | On-chain analytics (unused) |
-| `src/api/gamma.py` | Market metadata (place_45.py has inline version) |
-| `src/api/clob.py` | Orderbook API (place_45.py uses SDK directly) |
-| `src/analysis/strategy.py` | Trade pairing analysis (unused) |
-| `src/analysis/activity_watch.py` | Activity dedup (unused) |
-| `src/monitor/orderbook.py` | Old WS monitor (superseded by ws_book_feed.py) |
-| `src/monitor/spreads.py` | Spread scanner (standalone tool) |
+| File | What |
+|------|------|
+| `src/bot/ws_book_feed.py` | WebSocket orderbook feed (imported by place_45.py) |
+| `src/analysis/calculator.py` | P&L calculator (standalone analysis tool) |
 
 ## Running the Bot
 
