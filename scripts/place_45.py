@@ -170,6 +170,12 @@ BAIL_SCHEDULE = [
 # --- Stale order cancellation ---
 STALE_CANCEL_S = int(_env("PLACE_15_STALE_CANCEL_S", "", "660"))  # cancel unfilled orders at 11min (660s)
 
+# --- Fresh start flag ---
+# Set PLACE_15_FRESH_START=1 to skip the startup scan and clear all caches.
+# Use this when redeploying to a new VPS or after a long gap — avoids stale state
+# from old runs (mismatched market timestamps, wrong clock, stale balance cache).
+FRESH_START = _env("PLACE_15_FRESH_START", "", "0").strip().lower() in ("1", "true", "yes")
+
 # --- Risk limits (optional) ---
 MAX_OPEN_MARKETS = int(_env("PLACE_15_MAX_OPEN_MARKETS", "PLACE_45_MAX_OPEN_MARKETS", "0"))
 HEDGE_USE_REST_FALLBACK = _env("PLACE_15_REST_FALLBACK", "PLACE_45_REST_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
@@ -252,8 +258,36 @@ _SLUG_RE = re.compile(r"^btc-updown-15m-\d+$")
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=15)
+        # Browser-like headers required on VPS/datacenter IPs where Cloudflare
+        # guards Gamma API — without these it returns an HTML challenge page
+        # instead of JSON, causing r.json() to throw a JSONDecodeError.
+        _http_client = httpx.AsyncClient(
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://polymarket.com/",
+                "Origin": "https://polymarket.com",
+            },
+        )
     return _http_client
+
+
+def _check_json_response(r) -> None:
+    """Raise a clear error if the API returned HTML instead of JSON.
+
+    Cloudflare (common on VPS IPs) returns HTML challenge/block pages with
+    status 200 or 403. Without this check the error is a cryptic JSONDecodeError.
+    """
+    ct = r.headers.get("content-type", "")
+    body_start = r.text[:100].lstrip()
+    if "html" in ct.lower() or body_start.startswith("<!"):
+        raise ValueError(
+            f"Gamma API returned HTML instead of JSON "
+            f"(Cloudflare block? VPS IP may need whitelisting). "
+            f"status={r.status_code} content-type={ct!r} body={r.text[:120]!r}"
+        )
 
 
 def _parse_gamma_market(m: dict) -> dict | None:
@@ -310,6 +344,7 @@ async def _fallback_market_scan(ts: int) -> dict | None:
             "ascending": "true",
         })
         r.raise_for_status()
+        _check_json_response(r)
         markets = r.json()
     except Exception as e:
         log.warning("Fallback market scan failed: %s", e)
@@ -368,6 +403,7 @@ async def get_market_info(slug: str) -> dict:
     c = _get_http_client()
     r = await c.get(f"{GAMMA_URL}/events", params={"slug": slug})
     r.raise_for_status()
+    _check_json_response(r)
     data = r.json()
 
     if not data:
@@ -407,16 +443,18 @@ async def get_market_info(slug: str) -> dict:
         condition_id = _validate_condition_id(condition_id)
 
     # --- Duration sanity check (must be ~900s for 15-minute markets) ---
-    # IMPORTANT: use eventStartTime (actual 15-min window open), NOT startDate.
-    # startDate = event creation date (days/weeks ago) → endDate - startDate ≈ 800000s.
-    # eventStartTime = when THIS 15-min window opened → endDate - eventStartTime ≈ 900s.
+    # ONLY use eventStartTime — the actual 15-min window open time.
+    # Do NOT fall back to startDate (event CREATION date, days ago → ~800000s "duration").
+    # If eventStartTime is absent, skip the check entirely rather than false-failing.
     end_date = m.get("endDate") or m.get("end_date_iso") or ""
-    start_date = m.get("eventStartTime") or m.get("startDate") or m.get("start_date_iso") or ""
-    if end_date and start_date:
+    event_start_time = m.get("eventStartTime") or ""
+    if not event_start_time:
+        log.debug("eventStartTime absent for %s — skipping duration check", slug)
+    elif end_date:
         from datetime import datetime
         try:
             t_end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
-            t_start = datetime.fromisoformat(start_date.replace("Z", "+00:00")).timestamp()
+            t_start = datetime.fromisoformat(event_start_time.replace("Z", "+00:00")).timestamp()
             duration = t_end - t_start
             if abs(duration - WINDOW_S) > 60:  # allow 1 min tolerance
                 log.warning("wrong_market_duration: %.0fs (expected %ds) for %s", duration, WINDOW_S, slug)
@@ -1300,7 +1338,20 @@ async def run():
     # Initialize fill deduplicator (crash-safe, persists seen fills across restarts)
     dedup_path = os.path.join(_trade_log_dir, "seen_fills.json")
     _FILL_DEDUP = FillDeduplicator(dedup_path)
-    log.info("Fill deduplicator: %d fills loaded from %s", _FILL_DEDUP.count, dedup_path)
+
+    if FRESH_START:
+        # Clear all runtime state — useful when deploying to a new VPS or after
+        # a long gap where cached market timestamps / clock drift would cause issues.
+        log.info("FRESH_START=1: clearing all caches and skipping startup scan.")
+        _FILL_DEDUP.clear()
+        _balance_cache.clear()
+        # Recreate the HTTP client so stale connections are dropped
+        global _http_client
+        if _http_client and not _http_client.is_closed:
+            await _http_client.aclose()
+            _http_client = None
+    else:
+        log.info("Fill deduplicator: %d fills loaded from %s", _FILL_DEDUP.count, dedup_path)
 
     # Start WebSocket feed for real-time prices
     ws_feed = WSBookFeed()
@@ -1313,51 +1364,55 @@ async def run():
     # Start fast hedge loop (1s interval) as a background task
     asyncio.create_task(hedge_loop(client, ws_feed, past_markets))
 
-    # Scan recent markets (last 2 hours) for unredeemed positions on startup
+    # Scan recent markets (last 2 hours) for unredeemed positions on startup.
+    # Skipped when FRESH_START=1 — bot starts with a completely clean slate.
     now = int(time.time())
-    log.info("Scanning recent markets for unredeemed positions...")
-    # Scan last 2 hours of 15-minute markets (7200s / 900s = 8 markets)
-    scan_ts = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
-    while scan_ts < now:
-        slug = get_market_slug(scan_ts)
-        try:
-            mkt = await get_market_info(slug)
-            past_markets[scan_ts] = {
-                "redeemed": False,
-                "closed": mkt["closed"],
-                "up_token": mkt["up_token"],
-                "dn_token": mkt["dn_token"],
-                "condition_id": mkt["conditionId"],
-                "neg_risk": mkt.get("neg_risk", False),
-                "title": mkt.get("title", slug),
-                # Use market start as anchor so hedge windows work correctly
-                # if this market has a one-sided fill when we pick it up.
-                "placed_at": 0 if mkt["closed"] else scan_ts,
-            }
-            # IMPORTANT: Only add to placed_markets (preventing re-placement) if:
-            #   - market is closed (no point placing), OR
-            #   - we're past the placement window (too late to enter)
-            # If we're still within the window, let the main loop decide
-            # (it will check balance + live orders before placing).
-            secs_since_open = now - scan_ts
-            if mkt["closed"] or secs_since_open > NEW_MARKET_PLACE_WINDOW_SECONDS:
-                placed_markets.add(scan_ts)
-            else:
-                log.info(
-                    "Startup: market %d is open and within %ds window (%ds elapsed) — "
-                    "leaving for main loop to handle",
-                    scan_ts, NEW_MARKET_PLACE_WINDOW_SECONDS, secs_since_open,
-                )
-            # Subscribe to WS feed so prices are available for active markets
-            if not mkt["closed"]:
-                if not ws_feed.is_connected:
-                    await ws_feed.start([mkt["up_token"], mkt["dn_token"]])
+    if FRESH_START:
+        log.info("Startup scan skipped (FRESH_START=1). Starting clean.")
+    else:
+        log.info("Scanning recent markets for unredeemed positions...")
+        # Scan last 2 hours of 15-minute markets (7200s / 900s = 8 markets)
+        scan_ts = (now - 7200) // MARKET_PERIOD * MARKET_PERIOD
+        while scan_ts < now:
+            slug = get_market_slug(scan_ts)
+            try:
+                mkt = await get_market_info(slug)
+                past_markets[scan_ts] = {
+                    "redeemed": False,
+                    "closed": mkt["closed"],
+                    "up_token": mkt["up_token"],
+                    "dn_token": mkt["dn_token"],
+                    "condition_id": mkt["conditionId"],
+                    "neg_risk": mkt.get("neg_risk", False),
+                    "title": mkt.get("title", slug),
+                    # Use market start as anchor so hedge windows work correctly
+                    # if this market has a one-sided fill when we pick it up.
+                    "placed_at": 0 if mkt["closed"] else scan_ts,
+                }
+                # IMPORTANT: Only add to placed_markets (preventing re-placement) if:
+                #   - market is closed (no point placing), OR
+                #   - we're past the placement window (too late to enter)
+                # If we're still within the window, let the main loop decide
+                # (it will check balance + live orders before placing).
+                secs_since_open = now - scan_ts
+                if mkt["closed"] or secs_since_open > NEW_MARKET_PLACE_WINDOW_SECONDS:
+                    placed_markets.add(scan_ts)
                 else:
-                    await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
-        except Exception:
-            pass
-        scan_ts += MARKET_PERIOD
-    log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
+                    log.info(
+                        "Startup: market %d is open and within %ds window (%ds elapsed) — "
+                        "leaving for main loop to handle",
+                        scan_ts, NEW_MARKET_PLACE_WINDOW_SECONDS, secs_since_open,
+                    )
+                # Subscribe to WS feed so prices are available for active markets
+                if not mkt["closed"]:
+                    if not ws_feed.is_connected:
+                        await ws_feed.start([mkt["up_token"], mkt["dn_token"]])
+                    else:
+                        await ws_feed.subscribe([mkt["up_token"], mkt["dn_token"]])
+            except Exception:
+                pass
+            scan_ts += MARKET_PERIOD
+        log.info("Found %d recent markets to track for redemption.\n", len(past_markets))
 
     # Pre-fetch cache for next market (avoids get_market_info wait when new period starts)
     next_market_cache = {"ts": None, "mkt": None}
