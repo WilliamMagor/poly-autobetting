@@ -45,6 +45,10 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.bot.ws_book_feed import WSBookFeed
+from src.bot.math_engine import FeeParams, taker_fee_usdc, effective_fee_rate
+from src.bot.types import PositionState
+from src.bot.fill_monitor import FillDeduplicator
+from src.bot.risk_engine import RiskLimits, RiskEngine as _RiskEngine
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
@@ -125,12 +129,17 @@ ENTRY_PRICE_VOL_LOW  = float(_env("PLACE_15_ENTRY_VOL_LOW", "", "0.47"))    # ti
 
 # --- Trailing hedge config (re-tuned for 15-minute windows) ---
 # Only place initial orders within the first N seconds of a market period.
-NEW_MARKET_PLACE_WINDOW_SECONDS = int(_env("PLACE_15_PLACE_WINDOW_S", "", "30"))
+NEW_MARKET_PLACE_WINDOW_SECONDS = int(_env("PLACE_15_PLACE_WINDOW_S", "", "90"))
 # After one side fills, cancel unfilled limit and trail the cheap side.
 # Time windows (seconds elapsed since MARKET START):
-HEDGE_START_AFTER_S = int(_env("PLACE_15_HEDGE_START_S", "", "240"))   # 4-min: start acting (cancel + trail)
+HEDGE_START_AFTER_S = int(_env("PLACE_15_HEDGE_START_S", "", "240"))   # 4-min INTO 15-min market: start acting
 # Note: fills are detected from t=0 and trailing floor is tracked immediately,
 # but no cancel/buy actions happen until HEDGE_START_AFTER_S.
+# These are phases WITHIN the 15-minute market, not market durations:
+#   Phase 1 (0-240s / 0-4min):   Detect fills, track floor. No action — let other side fill.
+#   Phase 2 (240-600s / 4-10min): Cancel unfilled limit, trail with tight band.
+#   Phase 3 (600-720s / 10-12min): Widen band. Keep trailing.
+#   Phase 4 (720s+ / 12-15min):   Emergency — force-buy or sell filled side.
 HEDGE_MID_AFTER_S   = int(_env("PLACE_15_HEDGE_MID_S", "", "600"))    # 10-min: widen band
 HEDGE_LATE_AFTER_S  = int(_env("PLACE_15_HEDGE_LATE_S", "", "720"))   # 12-min: force-buy window
 # Band thresholds: PRICE + hedge_ask must stay below 1.00 to be profitable.
@@ -168,6 +177,22 @@ HEDGE_USE_REST_FALLBACK = _env("PLACE_15_REST_FALLBACK", "PLACE_45_REST_FALLBACK
 # --- Integrity / heartbeat (reserved for runner.py / session_loop.py integration) ---
 INTEGRITY_INTERVAL_S = int(_env("PLACE_15_INTEGRITY_INTERVAL_S", "", "3"))
 HEARTBEAT_INTERVAL_S = int(_env("PLACE_15_HEARTBEAT_INTERVAL_S", "", "5"))
+
+# --- Fee parameters (Polymarket CLOB taker fee model) ---
+# BTC crypto markets: feeRate=0.25, exponent=2. Max effective rate ~1.56% at 50c.
+# Maker orders (our limit buys) pay ZERO fee — only taker hedges incur fees.
+_FEE_PARAMS = FeeParams.for_crypto()
+
+# --- Risk limits for circuit breakers ---
+_RISK_LIMITS = RiskLimits(
+    max_vwap_ratio=1.02,    # cancel all when combined VWAP >= 1.02
+    max_vwap_shares=200.0,  # ...at 200+ total shares
+    max_imbalance_ratio=0.15,  # cancel all when one-sided at 15%+
+    max_imbalance_shares=100.0,  # ...at 100+ total shares
+)
+
+# --- Fill deduplicator (crash-safe, persisted between restarts) ---
+_FILL_DEDUP: FillDeduplicator | None = None  # initialized in run()
 
 # --- Speed: pre-fetch next market when this many seconds until start
 NEXT_MARKET_PREFETCH_SEC = 120  # 2 min before (longer window = more time to prefetch)
@@ -231,8 +256,104 @@ def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def _parse_gamma_market(m: dict) -> dict | None:
+    """Parse a single Gamma market dict into our internal format.
+
+    Returns dict with up_token, dn_token, etc., or None if parsing fails.
+    Shared by both slug-lookup and fallback-scan paths.
+    """
+    from datetime import datetime
+
+    tokens_raw = m.get("clobTokenIds", [])
+    tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+    if not isinstance(tokens, list) or len(tokens) < 2:
+        return None
+
+    condition_id = m.get("conditionId", "")
+    if not condition_id or not condition_id.startswith("0x") or len(condition_id) < 64:
+        return None
+
+    fee_rate_bps = None
+    try:
+        fee_raw = m.get("fee") or m.get("feeRateBps") or m.get("fee_rate_bps")
+        if fee_raw is not None:
+            fee_rate_bps = float(fee_raw)
+    except (ValueError, TypeError):
+        pass
+
+    return {
+        "up_token": str(tokens[0]),
+        "dn_token": str(tokens[1]),
+        "title": m.get("question", m.get("slug", "")),
+        "conditionId": condition_id,
+        "closed": bool(m.get("closed", False)),
+        "neg_risk": bool(m.get("negRisk", False)),
+        "fee_rate_bps": fee_rate_bps,
+    }
+
+
+async def _fallback_market_scan(ts: int) -> dict | None:
+    """Scan active markets to find BTC 15-min market at given slot timestamp.
+
+    Gamma's slug index sometimes lags by minutes at market open.
+    This is the fallback used by market_scheduler.py for the same reason.
+    Scans /markets?active=true and filters by BTC + 15-min + slot match.
+    """
+    from datetime import datetime
+    c = _get_http_client()
+    try:
+        r = await c.get(f"{GAMMA_URL}/markets", params={
+            "limit": 200,
+            "active": "true",
+            "closed": "false",
+            "order": "endDate",
+            "ascending": "true",
+        })
+        r.raise_for_status()
+        markets = r.json()
+    except Exception as e:
+        log.warning("Fallback market scan failed: %s", e)
+        return None
+
+    for m in markets:
+        question = str(m.get("question", "")).lower()
+        mslug = str(m.get("slug", "")).lower()
+        is_btc = "btc" in question or "btc" in mslug or "bitcoin" in question
+        is_15m = "15m" in mslug or "15 min" in question or "updown" in mslug
+        if not (is_btc and is_15m):
+            continue
+
+        # Validate duration matches WINDOW_S (~900s)
+        start_date = m.get("startDate") or m.get("start_date_iso") or ""
+        end_date = m.get("endDate") or m.get("end_date_iso") or ""
+        if not start_date or not end_date:
+            continue
+        try:
+            t_start = datetime.fromisoformat(start_date.replace("Z", "+00:00")).timestamp()
+            t_end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        duration = t_end - t_start
+        if abs(duration - WINDOW_S) > 60:
+            continue  # not a 15-min market
+        if abs(int(t_start) - ts) > 60:
+            continue  # doesn't match expected time slot
+
+        result = _parse_gamma_market(m)
+        if result:
+            log.info("Fallback market discovery: %s", m.get("question", mslug)[:80])
+            return result
+
+    return None
+
+
 async def get_market_info(slug: str) -> dict:
-    """Fetch market info from gamma API with input validation."""
+    """Fetch market info from Gamma API with input validation.
+
+    Primary path: slug-based /events lookup.
+    Fallback path: active market scan when Gamma's slug index lags
+    (this is common at market open — see market_scheduler.py for context).
+    """
     if not slug or not isinstance(slug, str):
         raise ValueError(f"Invalid slug: expected non-empty string, got {slug}")
     if len(slug) > 200:
@@ -246,7 +367,13 @@ async def get_market_info(slug: str) -> dict:
     data = r.json()
 
     if not data:
-        raise ValueError(f"No event found for slug: {slug}")
+        # Gamma slug index sometimes lags — try active market scan as fallback
+        ts = int(slug.rsplit("-", 1)[-1])
+        log.info("Slug %s not indexed yet — trying fallback scan (ts=%d)", slug, ts)
+        fallback = await _fallback_market_scan(ts)
+        if fallback:
+            return fallback
+        raise ValueError(f"No event found for slug: {slug} (fallback scan also failed)")
 
     # Validate response structure
     if not isinstance(data, list) or len(data) == 0:
@@ -517,22 +644,48 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
 
             if up_bal > 0 and dn_bal == 0:
                 hedge_side, filled_bal = "dn", up_bal
+                filled_side_label = "UP"
             elif dn_bal > 0 and up_bal == 0:
                 hedge_side, filled_bal = "up", dn_bal
+                filled_side_label = "DN"
             else:
                 continue
 
+            # Fill deduplication: generate a synthetic fill ID from the market
+            # state. Prevents the same one-sided fill from being re-processed
+            # on restart (balance persists across restarts, hedge state doesn't).
+            fill_id = f"fill-{ts}-{filled_side_label}-{int(filled_bal * 100)}"
+            if _FILL_DEDUP is not None and not _FILL_DEDUP.process(fill_id):
+                # Already processed this fill — hedge state must have been lost
+                # on restart. Restore from balance.
+                info["hedge_side"] = hedge_side
+                info["filled_bal"] = filled_bal
+                info["trailing_min_ask"] = None
+                log.info(
+                    "  HEDGE restored one-sided fill at %ds: %s filled (dedup: fill already known)",
+                    time_elapsed, filled_side_label,
+                )
+                continue
+
+            # Update per-market PositionState for risk tracking
+            pos: PositionState | None = info.get("position")
+            if pos is not None:
+                if filled_side_label == "UP":
+                    pos.up_shares = float(up_bal)
+                    pos.up_cost = float(up_bal) * PRICE
+                else:
+                    pos.down_shares = float(dn_bal)
+                    pos.down_cost = float(dn_bal) * PRICE
+
             log.info(
                 "  HEDGE detected one-sided fill at %ds: %s filled, tracking %s",
-                time_elapsed,
-                "UP" if hedge_side == "dn" else "DN",
-                hedge_side.upper(),
+                time_elapsed, filled_side_label, hedge_side.upper(),
             )
             info["hedge_side"] = hedge_side
             info["filled_bal"] = filled_bal
             info["trailing_min_ask"] = None
             log_trade("fill_detected", market_ts=ts,
-                      filled_side="UP" if hedge_side == "dn" else "DN",
+                      filled_side=filled_side_label,
                       filled_bal=filled_bal, hedge_side=hedge_side.upper(),
                       elapsed_s=time_elapsed)
 
@@ -586,12 +739,22 @@ async def check_hedge_trailing(client, ws_feed: "WSBookFeed", past_markets: dict
         else:
             band = HEDGE_BAND_EARLY
 
-        # --- Step 5: EV guard — never hedge if combined > cap ---
+        # --- Step 5: EV guard — never hedge if fee-adjusted EV is negative ---
+        # Taker fee for the hedge order (maker entry = zero fee; hedge = taker fee).
+        # Formula: fee = shares * price * feeRate * (price * (1-price))^exponent
         combined = PRICE + hedge_ask
-        if combined > HEDGE_MAX_COMBINED and band != HEDGE_BAND_LATE:
+        try:
+            hedge_fee = taker_fee_usdc(SHARES_PER_SIDE, hedge_ask, _FEE_PARAMS)
+            eff_rate = effective_fee_rate(hedge_ask, _FEE_PARAMS)
+        except ValueError:
+            hedge_fee, eff_rate = 0.0, 0.0
+        hedge_ev = SHARES_PER_SIDE * (1.0 - PRICE - hedge_ask) - hedge_fee
+        if (combined > HEDGE_MAX_COMBINED or hedge_ev <= 0) and band != HEDGE_BAND_LATE:
             log.info(
-                "  HEDGE EV-skip: combined=%.3f > cap=%.2f (elapsed=%ds)",
-                combined, HEDGE_MAX_COMBINED, time_elapsed,
+                "  HEDGE EV-skip: combined=%.3f cap=%.2f fee=%.4f (rate=%.2f%%) "
+                "EV=%.4f (elapsed=%ds)",
+                combined, HEDGE_MAX_COMBINED, hedge_fee, eff_rate * 100,
+                hedge_ev, time_elapsed,
             )
             continue
 
@@ -1113,17 +1276,24 @@ async def hedge_loop(client, ws_feed: "WSBookFeed", past_markets: dict):
 _shutdown = False
 
 async def run():
-    global _shutdown
+    global _shutdown, _FILL_DEDUP
     open_trade_log()
     log.info("Initializing SDK...")
     client = init_clob_client()
     redeemer = init_redeemer()
 
     log.info("SDK ready. Placing %.0fc orders on BTC %s markets.", PRICE * 100, TIMEFRAME)
+    log.info("  Fee params: rate=%.2f exponent=%.0f (max eff. rate=~1.56%% at 50c)",
+             _FEE_PARAMS.fee_rate, _FEE_PARAMS.exponent)
     if redeemer:
         log.info("Auto-redeem enabled (on-chain via %s).\n", redeemer[1].address)
     else:
         log.info("Auto-redeem DISABLED (no private key / RPC).\n")
+
+    # Initialize fill deduplicator (crash-safe, persists seen fills across restarts)
+    dedup_path = os.path.join(_trade_log_dir, "seen_fills.json")
+    _FILL_DEDUP = FillDeduplicator(dedup_path)
+    log.info("Fill deduplicator: %d fills loaded from %s", _FILL_DEDUP.count, dedup_path)
 
     # Start WebSocket feed for real-time prices
     ws_feed = WSBookFeed()
@@ -1157,7 +1327,20 @@ async def run():
                 # if this market has a one-sided fill when we pick it up.
                 "placed_at": 0 if mkt["closed"] else scan_ts,
             }
-            placed_markets.add(scan_ts)
+            # IMPORTANT: Only add to placed_markets (preventing re-placement) if:
+            #   - market is closed (no point placing), OR
+            #   - we're past the placement window (too late to enter)
+            # If we're still within the window, let the main loop decide
+            # (it will check balance + live orders before placing).
+            secs_since_open = now - scan_ts
+            if mkt["closed"] or secs_since_open > NEW_MARKET_PLACE_WINDOW_SECONDS:
+                placed_markets.add(scan_ts)
+            else:
+                log.info(
+                    "Startup: market %d is open and within %ds window (%ds elapsed) — "
+                    "leaving for main loop to handle",
+                    scan_ts, NEW_MARKET_PLACE_WINDOW_SECONDS, secs_since_open,
+                )
             # Subscribe to WS feed so prices are available for active markets
             if not mkt["closed"]:
                 if not ws_feed.is_connected:
@@ -1202,7 +1385,13 @@ async def run():
                 try:
                     mkt = await get_market_info(slug)
                 except Exception as e:
-                    log.debug("Market %s not available yet: %s", slug, e)
+                    secs_until_ts = ts - now
+                    if secs_until_ts > 60:
+                        # Future market — silently wait
+                        log.debug("Market %s not available yet (+%ds): %s", slug, secs_until_ts, e)
+                    else:
+                        # Current/near market — this is unexpected, log visibly
+                        log.info("Market %s lookup failed (%ds): %s", slug, secs_until_ts, e)
                     continue
 
             secs_until = ts - now
@@ -1350,6 +1539,8 @@ async def run():
                 # (240s, 600s, 720s) are relative to market start,
                 # not to when place_order() returned.
                 "placed_at": ts,
+                # PositionState tracks fills for this market (updated by hedge_loop)
+                "position": PositionState(),
             }
 
         # Log WS prices for active (unresolved, unhedged) markets
@@ -1417,6 +1608,9 @@ async def run():
 
     # Clean shutdown
     log.info("Shutting down...")
+    if _FILL_DEDUP is not None:
+        _FILL_DEDUP.save()
+        log.info("Fill deduplicator saved (%d fills).", _FILL_DEDUP.count)
     await ws_feed.close()
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()

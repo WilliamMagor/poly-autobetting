@@ -147,6 +147,57 @@ class PositionState:
             return 0.0
         return min(self.risk_pnl_if_up, self.risk_pnl_if_down)
 
+    # --- Aliases / additional properties (per plan spec) ---
+
+    @property
+    def dn_shares(self) -> float:
+        """Alias for down_shares (plan spec naming)."""
+        return self.down_shares
+
+    @property
+    def up_avg_price(self) -> float:
+        """Average (VWAP) price paid for Up shares."""
+        return self.up_vwap
+
+    @property
+    def dn_avg_price(self) -> float:
+        """Average (VWAP) price paid for Down shares."""
+        return self.down_vwap
+
+    @property
+    def is_dual(self) -> bool:
+        """True when we hold both Up and Down shares."""
+        return self.up_shares > 0 and self.down_shares > 0
+
+    @property
+    def imbalance_ratio(self) -> float:
+        """Alias for share_imbalance: excess / total (0 if no shares).
+
+        0 = perfectly balanced, 1 = completely one-sided.
+        """
+        return self.share_imbalance
+
+    @property
+    def vwap_cost_ratio(self) -> float:
+        """Combined VWAP: up_vwap + down_vwap.
+
+        < 1.0 = profitable (guaranteed $1 payout minus entry cost > 0).
+        Alias for combined_vwap with an intent-revealing name.
+        """
+        return self.combined_vwap
+
+    @property
+    def worst_case_exposure_usdc(self) -> float:
+        """Maximum possible dollar loss at resolution.
+
+        = total_cost - min(up_shares, down_shares)
+        Positive = exposed to loss; negative = guaranteed profit regardless of outcome.
+        """
+        if self.up_shares <= 0 and self.down_shares <= 0:
+            return 0.0
+        hedged = min(self.up_shares, self.down_shares)
+        return self.total_cost - hedged
+
 
 @dataclass
 class FillEvent:

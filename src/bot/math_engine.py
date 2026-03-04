@@ -2,10 +2,68 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from statistics import mean
 from typing import List, Tuple
 
 from src.bot.types import BotConfig, EdgeTier, LadderLevel, PositionState
+
+
+# ---------------------------------------------------------------------------
+# Fee calculation (Polymarket CLOB taker fee model)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FeeParams:
+    """Polymarket CLOB taker fee parameters.
+
+    The fee formula is:  fee = C * p * feeRate * (p * (1-p))^exponent
+    where C = shares, p = price.
+
+    For crypto markets (BTC up/down): feeRate=0.25, exponent=2.
+    Max effective rate is ~1.56% at p=0.50.
+    Maker orders pay zero fee.
+    """
+    fee_rate: float = 0.25   # crypto markets: 25% of the vol component
+    exponent: float = 2.0    # squared variance term
+
+    @classmethod
+    def for_crypto(cls) -> "FeeParams":
+        """Default params for Polymarket crypto markets (BTC up/down)."""
+        return cls(fee_rate=0.25, exponent=2.0)
+
+
+def taker_fee_usdc(shares: float, price: float, fee: FeeParams) -> float:
+    """Polymarket taker fee in USDC.
+
+    Formula: fee = C * p * feeRate * (p * (1-p))^exponent
+    where C=shares, p=price in (0, 1).
+
+    Returns 0.0 for maker orders (zero maker fee).
+    Raises ValueError for invalid inputs.
+    """
+    if not (0.0 < price < 1.0):
+        raise ValueError(f"price must be in (0, 1), got {price}")
+    if shares <= 0:
+        raise ValueError(f"shares must be positive, got {shares}")
+    return shares * price * fee.fee_rate * (price * (1.0 - price)) ** fee.exponent
+
+
+def effective_fee_rate(price: float, fee: FeeParams) -> float:
+    """Effective taker fee as a fraction of notional (fee / (shares * price)).
+
+    = feeRate * (p * (1-p))^exponent
+    Useful for understanding the fee drag at a given price level.
+    Returns 0.0 for invalid prices.
+    """
+    if not (0.0 < price < 1.0):
+        return 0.0
+    return fee.fee_rate * (price * (1.0 - price)) ** fee.exponent
+
+
+def snap_to_tick(price: float, tick_size: float) -> float:
+    """Snap price to nearest valid tick (alias for round_to_tick)."""
+    return round_to_tick(price, tick_size)
 
 
 def estimate_initial_edge(up_ask: float, down_ask: float) -> EdgeTier:

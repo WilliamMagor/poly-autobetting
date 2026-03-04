@@ -12,7 +12,10 @@ Single-writer pattern: publishes FillEvents to queue, runner handles state.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import time
 from typing import Dict, Optional, Set
 
@@ -414,3 +417,80 @@ class OrderReconciler:
         if missing:
             logger.warning("Reconciliation: %d orders disappeared (exchange-cancelled)", len(missing))
         return missing
+
+
+class FillDeduplicator:
+    """Crash-safe fill deduplication using a persisted seen_trade_ids set.
+
+    Suitable for integration into place_45.py as a standalone module —
+    no ExchangeClient dependency.  Atomically persists seen trade IDs to
+    disk so a crash-restart doesn't double-count fills.
+
+    Usage:
+        dedup = FillDeduplicator("logs/seen_fills.json")
+        if dedup.process("trade-abc-123"):
+            # new fill — update position
+        dedup.save()  # call periodically or on shutdown
+    """
+
+    def __init__(self, persist_path: Optional[str] = None) -> None:
+        self._seen: Set[str] = set()
+        self._path = persist_path
+        if persist_path:
+            self._load()
+
+    def _load(self) -> None:
+        """Load persisted trade IDs from disk (called at startup)."""
+        if not self._path:
+            return
+        try:
+            with open(self._path) as f:
+                data = json.load(f)
+            self._seen = set(data.get("seen_trade_ids", []))
+            logger.info(
+                "FillDeduplicator: loaded %d trade IDs from %s",
+                len(self._seen), self._path,
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("FillDeduplicator: failed to load %s: %s", self._path, e)
+
+    def save(self) -> None:
+        """Persist seen trade IDs to disk (atomic write via temp file)."""
+        if not self._path:
+            return
+        data = {"seen_trade_ids": list(self._seen)}
+        dir_ = os.path.dirname(os.path.abspath(self._path))
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as f:
+                json.dump(data, f)
+                tmp = f.name
+            os.replace(tmp, self._path)
+        except Exception as e:
+            logger.warning("FillDeduplicator: failed to save %s: %s", self._path, e)
+
+    def process(self, trade_id: str) -> bool:
+        """Check and mark a trade_id atomically.
+
+        Returns True if trade_id is NEW (should be processed).
+        Returns False if already seen (duplicate — skip).
+        """
+        if trade_id in self._seen:
+            logger.debug("FillDeduplicator: duplicate trade_id=%s (skipping)", trade_id)
+            return False
+        self._seen.add(trade_id)
+        return True
+
+    def is_seen(self, trade_id: str) -> bool:
+        """Return True if trade_id was already processed."""
+        return trade_id in self._seen
+
+    def clear(self) -> None:
+        """Clear all seen trade IDs (call at session start if needed)."""
+        self._seen.clear()
+
+    @property
+    def count(self) -> int:
+        """Number of unique trade IDs seen."""
+        return len(self._seen)

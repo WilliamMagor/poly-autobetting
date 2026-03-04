@@ -9,11 +9,24 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 
 from src.bot.types import BotConfig, BotState, FillEvent, PositionState
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RiskLimits:
+    """Simple standalone risk limits for the dual-side arb bot.
+
+    Used by RiskEngine.evaluate() which requires no BotConfig/BotState —
+    suitable for place_45.py integration without the full bot framework.
+    """
+    max_vwap_ratio: float = 1.02         # CANCEL_ALL when combined VWAP >= this
+    max_vwap_shares: float = 200.0       # ...but only when total_shares >= this
+    max_imbalance_ratio: float = 0.15    # CANCEL_ALL when imbalance ratio >= this
+    max_imbalance_shares: float = 100.0  # ...but only when total_shares >= this
 
 
 class RiskAction(Enum):
@@ -140,6 +153,56 @@ class RiskEngine:
     def reset_session(self) -> None:
         """Reset per-session counters."""
         self._consecutive_api_failures = 0
+
+    def evaluate(self, pos_state: PositionState, limits: Optional[RiskLimits] = None) -> List[dict]:
+        """Check circuit breakers against a PositionState.
+
+        Returns a list of triggered action dicts (empty = all clear).
+        Each dict has keys: action (str), reason (str), and metric details.
+
+        Designed for place_45.py integration — requires no BotState/BotConfig,
+        just a PositionState and optional RiskLimits (defaults to conservative).
+        """
+        if limits is None:
+            limits = RiskLimits()
+
+        triggered = []
+
+        # Circuit breaker 1: VWAP ratio — buying at combined price > 1.02
+        if (pos_state.total_shares >= limits.max_vwap_shares
+                and pos_state.combined_vwap >= limits.max_vwap_ratio):
+            triggered.append({
+                "action": "CANCEL_ALL",
+                "reason": "VWAP_RATIO",
+                "vwap": round(pos_state.combined_vwap, 4),
+                "total_shares": pos_state.total_shares,
+                "threshold": limits.max_vwap_ratio,
+            })
+            logger.warning(
+                "RiskEngine: VWAP_RATIO triggered — combined_vwap=%.4f >= %.2f "
+                "at %.0f shares",
+                pos_state.combined_vwap, limits.max_vwap_ratio, pos_state.total_shares,
+            )
+
+        # Circuit breaker 2: Share imbalance — one side too heavy
+        if (pos_state.total_shares >= limits.max_imbalance_shares
+                and pos_state.share_imbalance >= limits.max_imbalance_ratio):
+            triggered.append({
+                "action": "CANCEL_ALL",
+                "reason": "IMBALANCE",
+                "imbalance": round(pos_state.share_imbalance, 4),
+                "total_shares": pos_state.total_shares,
+                "threshold": limits.max_imbalance_ratio,
+            })
+            logger.warning(
+                "RiskEngine: IMBALANCE triggered — imbalance=%.1f%% >= %.0f%% "
+                "at %.0f shares",
+                pos_state.share_imbalance * 100,
+                limits.max_imbalance_ratio * 100,
+                pos_state.total_shares,
+            )
+
+        return triggered
 
     def reset_day(self) -> None:
         """Reset daily counters."""
