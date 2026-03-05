@@ -1,0 +1,7 @@
+py-clob-client
+python-dotenv
+httpx
+web3
+eth-account
+selenium
+webdriver-manager
