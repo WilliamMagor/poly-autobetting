@@ -1,7 +1,8 @@
 py-clob-client
 python-dotenv
-httpx
+httpx[http2]
 web3
 eth-account
-selenium
-webdriver-manager
+websockets
+py-builder-relayer-client
+py-builder-signing-sdk

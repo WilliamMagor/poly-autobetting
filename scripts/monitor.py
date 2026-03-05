@@ -1,7 +1,7 @@
 """
-Live terminal dashboard for the BTC 15-min bot (place_45.py).
+Live terminal dashboard for the BTC 15-min bot (selbot/bot.py).
 
-Reads today's JSONL trade log every 2s and renders a rich UI.
+Reads today's JSONL trade log and renders a rich UI.
 Run in a separate terminal alongside the bot:
 
     python scripts/monitor.py
@@ -23,6 +23,8 @@ from rich.table import Table
 from rich.text import Text
 
 LOG_DIR = Path(__file__).parent.parent / "logs"
+REFRESH_INTERVAL = 2
+MAX_DETAIL_LEN = 60
 
 SHOW_EVENTS = {
     "orders_placed", "fill_detected", "hedge_trigger", "hedge_buy",
@@ -55,7 +57,42 @@ def find_log() -> Path | None:
     return p if p.exists() else None
 
 
-def load_events(path: Path) -> list[dict]:
+def load_events_incremental(
+    path: Path,
+    last_pos: int,
+    cached_events: list[dict],
+) -> tuple[list[dict], int]:
+    """
+    Read only new lines from the log file. Returns (all_events, new_file_pos).
+    If file was truncated, falls back to full read.
+    """
+    try:
+        size = path.stat().st_size
+        if size < last_pos:
+            return load_events_full(path), size
+        with open(path, "r") as f:
+            f.seek(last_pos)
+            new_lines = f.readlines()
+            new_pos = f.tell()
+    except (OSError, IOError):
+        return cached_events, last_pos
+
+    if not new_lines:
+        return cached_events, new_pos
+
+    events = list(cached_events)
+    for line in new_lines:
+        line = line.strip()
+        if line:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return events, new_pos
+
+
+def load_events_full(path: Path) -> list[dict]:
+    """Full read when file changed or first load."""
     events = []
     try:
         with open(path, "r") as f:
@@ -125,8 +162,26 @@ def build_state(events: list[dict]) -> dict:
     return state
 
 
-def fmt_event(ev: dict) -> tuple[str, str, str]:
-    """Returns (time_str, label, detail) for an event row."""
+def rel_time(ts: int) -> str:
+    """Human-readable relative time: 'now', '1m ago', '5m ago'."""
+    if not ts:
+        return "??"
+    diff = int(time.time()) - ts
+    if diff < 10:
+        return "now"
+    if diff < 60:
+        return f"{diff}s"
+    if diff < 3600:
+        return f"{diff // 60}m"
+    return f"{diff // 3600}h"
+
+
+def _trunc(s: str, max_len: int = MAX_DETAIL_LEN) -> str:
+    return (s[: max_len - 1] + "…") if len(s) > max_len else s
+
+
+def fmt_event(ev: dict) -> tuple[str, str, str, str]:
+    """Returns (time_str, rel_str, label, detail) for an event row."""
     ts = ev.get("ts", 0)
     t = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "??:??:??"
     event = ev.get("event", "")
@@ -148,10 +203,10 @@ def fmt_event(ev: dict) -> tuple[str, str, str]:
         "crash_restart":         ("CRASH",    f"{ev.get('error','')}  backoff={ev.get('backoff_s',0):.0f}s"),
     }
     label, detail = dispatch.get(event, (event, ""))
-    return t, label, detail
+    return t, rel_time(ts), label, _trunc(detail)
 
 
-def build_dashboard(state: dict, log_path: Path | None, last_ts: int) -> Layout:
+def build_dashboard(state: dict, log_path: Path | None, last_ts: int, event_count: int) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
@@ -210,22 +265,24 @@ def build_dashboard(state: dict, log_path: Path | None, last_ts: int) -> Layout:
 
     # ── Recent events panel ───────────────────────────────────────────────────
     ev_tbl = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    ev_tbl.add_column("Time",   style="dim",   width=8)
+    ev_tbl.add_column("Time",    style="dim", width=8)
+    ev_tbl.add_column("Ago",     style="dim", width=5)
     ev_tbl.add_column("Event",                 width=10)
-    ev_tbl.add_column("Detail", style="white")
+    ev_tbl.add_column("Detail",  style="white")
 
     for ev in reversed(state["recent"]):
-        t, label, detail = fmt_event(ev)
+        t, rel, label, detail = fmt_event(ev)
         color = EVENT_COLORS.get(label, "white")
-        ev_tbl.add_row(t, Text(label, style=f"bold {color}"), detail)
+        ev_tbl.add_row(t, rel, Text(label, style=f"bold {color}"), detail)
 
-    layout["events"].update(Panel(ev_tbl, title="[bold]EVENTS[/bold]", border_style="blue"))
+    layout["events"].update(Panel(ev_tbl, title="[bold]EVENTS[/bold] (newest ↑)", border_style="blue"))
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    age = int(time.time()) - last_ts if last_ts else 0
+    age = int(time.time()) - last_ts if last_ts else 999
     log_name = log_path.name if log_path else "no log found — is the bot running?"
+    live_str = "[bold green]● live[/bold green]" if age < 15 else "[dim]○ idle[/dim]"
     footer = Text(
-        f"  {log_name}   last event: {age}s ago   {datetime.now().strftime('%H:%M:%S')}",
+        f"  {log_name}   {live_str}   last: {age}s ago   {event_count} events   {datetime.now().strftime('%H:%M:%S')}",
         style="dim",
     )
     layout["footer"].update(footer)
@@ -235,18 +292,32 @@ def build_dashboard(state: dict, log_path: Path | None, last_ts: int) -> Layout:
 
 def main():
     console = Console()
+    cached_events: list[dict] = []
+    last_pos = 0
+    last_log_path: Path | None = None
+
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
             log_path = find_log()
             if log_path:
-                events = load_events(log_path)
-                state  = build_state(events)
+                # Incremental load: only read new lines when same file; full reload on path change
+                if log_path != last_log_path:
+                    events = load_events_full(log_path)
+                    last_pos = log_path.stat().st_size if log_path.exists() else 0
+                    last_log_path = log_path
+                else:
+                    events, last_pos = load_events_incremental(log_path, last_pos, cached_events)
+                cached_events = events
+                state = build_state(events)
                 last_ts = events[-1].get("ts", 0) if events else 0
             else:
-                state   = build_state([])
+                state = build_state([])
                 last_ts = 0
-            live.update(build_dashboard(state, log_path, last_ts))
-            time.sleep(2)
+                last_log_path = None
+                cached_events = []
+
+            live.update(build_dashboard(state, log_path, last_ts, len(cached_events)))
+            time.sleep(REFRESH_INTERVAL)
 
 
 if __name__ == "__main__":

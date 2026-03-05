@@ -15,34 +15,18 @@ The bot targets BTC 15-minute up/down binary markets on Polymarket. It places li
 ## Project Structure
 
 ```
+selbot/
+  bot.py           # Main bot script
+  prices.py        # Balance check + TTL cache
+  requirements.txt
+src/bot/
+  ws_book_feed.py  # WebSocket order book feed
+  math_engine.py   # Fee calculation
+  types.py         # Data types (PositionState, FillEvent)
+  fill_monitor.py  # FillDeduplicator for crash-safe fill tracking
 scripts/
-  place_45.py          # Main bot script
-src/
-  config.py            # Polymarket endpoints and fee config
-  api/
-    gamma.py           # Market discovery and metadata
-    clob.py            # Order book and trade data
-    data_api.py        # Data API client
-    polygonscan.py     # Polygon chain queries
-  bot/
-    runner.py          # Orchestrator / event loop
-    bot_config.py      # Configuration loader
-    order_engine.py    # Order placement and management
-    risk_engine.py     # Risk checks and circuit breakers
-    ws_book_feed.py    # WebSocket order book feed
-    fill_monitor.py    # Fill detection
-    position_tracker.py # Position and P&L tracking
-    session_loop.py    # Session primitives
-    market_scheduler.py # Market rotation
-    rebalance.py       # Position rebalancing
-    state_manager.py   # State persistence
-    math_engine.py     # Pricing utilities
-    alerts.py          # Alert handling
-    client.py          # CLOB SDK wrapper
-    types.py           # Shared types
-    backtest.py        # Backtesting
-  analysis/            # Trade analysis and strategy evaluation
-  monitor/             # Order book and spread monitoring
+  monitor.py       # Live terminal dashboard (reads trade logs)
+logs/              # Trade logs (place_15_YYYYMMDD.jsonl)
 ```
 
 ## Setup
@@ -58,9 +42,11 @@ src/
 git clone https://github.com/0xalexkxk/poly-autobetting.git
 cd poly-autobetting
 
-python3 -m venv venv
-source venv/bin/activate
-pip install httpx python-dotenv py-clob-client py-builder-relayer-client web3 eth-abi
+python -m venv venv
+venv\Scripts\activate   # Windows
+# source venv/bin/activate  # Linux/Mac
+
+pip install -r selbot/requirements.txt
 ```
 
 ### Configuration
@@ -74,20 +60,25 @@ Edit `.env` with your values:
 | Variable | Description |
 |---|---|
 | `POLYMARKET_PRIVATE_KEY` | Your Polygon wallet private key |
-| `POLYMARKET_FUNDER` | Funder/proxy wallet address |
-| `POLYMARKET_BUILDER_API_KEY` | Builder relayer API key (for gasless redeems) |
-| `POLYMARKET_BUILDER_SECRET` | Builder relayer secret |
-| `POLYMARKET_BUILDER_PASSPHRASE` | Builder relayer passphrase |
-Builder relayer credentials are optional — without them, auto-redeem is disabled and you redeem manually.
+| `POLYMARKET_FUNDER` | Funder/proxy wallet address (optional) |
+| `POLYGON_RPC_URL` | Polygon RPC URL (optional, has default) |
 
 ## Usage
 
 ```bash
-source venv/bin/activate
-python scripts/place_45.py
+venv\Scripts\activate
+python selbot/bot.py
 ```
 
 The bot will place limit orders on both UP and DOWN for the current and upcoming BTC 15-minute markets, then loop to check for new markets, manage hedges/bails, and redeem resolved positions.
+
+### Monitor Dashboard
+
+Run in a separate terminal to view live trade activity:
+
+```bash
+python scripts/monitor.py
+```
 
 ## Disclaimer
 
