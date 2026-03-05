@@ -150,6 +150,7 @@ HEDGE_RETRY_INTERVAL_S = int(_env("PLACE_15_HEDGE_RETRY_S", "10"))
 STRATEGY_MODE = _env("PLACE_15_STRATEGY", "dual_hedge").strip().lower()
 BUY_HOLD_TRIGGER_PRICE = float(_env("PLACE_15_BUY_HOLD_TRIGGER_PRICE", "0.91"))
 BUY_HOLD_TRIGGER_REMAINING_S = int(_env("PLACE_15_BUY_HOLD_TRIGGER_REMAINING_S", "180"))
+BUY_HOLD_TARGET_SHARES = int(_env("PLACE_15_BUY_HOLD_TARGET_SHARES", "110"))
 PROFIT_BOOST_TRIGGER_PRICE = float(_env("PLACE_15_PROFIT_BOOST_TRIGGER_PRICE", "0.90"))
 PROFIT_BOOST_REMAINING_S = int(_env("PLACE_15_PROFIT_BOOST_REMAINING_S", "120"))
 PROFIT_BOOST_SHARES = int(_env("PLACE_15_PROFIT_BOOST_SHARES", "10"))
@@ -546,6 +547,96 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
     """Time-windowed trailing-stop hedge for one-sided fills."""
     now = int(time.time())
 
+    def _maybe_buy_hold_scale(
+        market_ts: int,
+        info: dict,
+        up_token: str,
+        dn_token: str,
+        up_bal: float,
+        dn_bal: float,
+        time_remaining: int,
+    ) -> bool:
+        if STRATEGY_MODE != "buy_hold_91":
+            return False
+        if time_remaining <= 0 or time_remaining > BUY_HOLD_TRIGGER_REMAINING_S:
+            return False
+
+        # buy_hold_91 scaling is only for one-sided positions.
+        if (up_bal > 0 and dn_bal > 0) or (up_bal <= 0 and dn_bal <= 0):
+            return False
+
+        up_ask = get_best_ask_safe(ws_feed, client, up_token)
+        dn_ask = get_best_ask_safe(ws_feed, client, dn_token)
+        candidates: list[tuple[str, str, float, float]] = []
+        if up_ask is not None and up_ask >= BUY_HOLD_TRIGGER_PRICE:
+            candidates.append(("UP", up_token, up_ask, up_bal))
+        if dn_ask is not None and dn_ask >= BUY_HOLD_TRIGGER_PRICE:
+            candidates.append(("DN", dn_token, dn_ask, dn_bal))
+        if not candidates:
+            return False
+        side_label, token_id, side_ask, side_bal = max(candidates, key=lambda item: item[2])
+
+        if not info.get("buy_hold_signal_logged"):
+            log.info(
+                "  BUY-HOLD signal: favored %s ask=%.3f >= %.2f with %ds left — scaling toward %.0f shares",
+                side_label, side_ask, BUY_HOLD_TRIGGER_PRICE, time_remaining, float(BUY_HOLD_TARGET_SHARES)
+            )
+            log_trade(
+                "buy_hold_signal",
+                market_ts=market_ts,
+                strategy=STRATEGY_MODE,
+                favored_side=side_label,
+                favored_ask=round(side_ask, 4),
+                trigger_price=BUY_HOLD_TRIGGER_PRICE,
+                remaining_s=time_remaining,
+            )
+            info["buy_hold_signal_logged"] = True
+        info["buy_hold"] = True
+        info["hedge_done"] = True
+
+        target_shares = max(float(SHARES_PER_SIDE), float(BUY_HOLD_TARGET_SHARES))
+        remaining = max(0.0, target_shares - side_bal)
+        if remaining <= 0.01:
+            info["buy_hold_scaled"] = True
+            log.info("  BUY-HOLD scale complete: %s already at %.1f shares", side_label, side_bal)
+            return True
+
+        last_try = info.get("buy_hold_last_try_ts", 0)
+        if now - last_try < HEDGE_RETRY_INTERVAL_S:
+            return True
+
+        log.info(
+            "  BUY-HOLD SCALE: %s ask=%.3f >= %.2f with %ds left — buying %.1f shares to %.0f target",
+            side_label,
+            side_ask,
+            BUY_HOLD_TRIGGER_PRICE,
+            time_remaining,
+            remaining,
+            target_shares,
+        )
+        oid = buy_hedge(
+            client,
+            token_id,
+            remaining,
+            side_label,
+            side_ask,
+            market_ts + WINDOW_S,
+        )
+        log_trade(
+            "buy_hold_scale_buy",
+            market_ts=market_ts,
+            strategy=STRATEGY_MODE,
+            side=side_label,
+            price=round(side_ask, 4),
+            shares=round(remaining, 4),
+            target_shares=target_shares,
+            order_id=oid,
+            trigger_price=BUY_HOLD_TRIGGER_PRICE,
+            remaining_s=time_remaining,
+        )
+        info["buy_hold_last_try_ts"] = now
+        return True
+
     def _maybe_late_profit_boost(
         market_ts: int,
         info: dict,
@@ -630,6 +721,7 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
             continue
 
         if info.get("hedge_done"):
+            _maybe_buy_hold_scale(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining)
             _maybe_late_profit_boost(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining)
             continue
 
@@ -677,29 +769,9 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
         filled_token = dn_token if hedge_side == "up" else up_token
         filled_label = "UP" if hedge_side == "dn" else "DN"
 
-        # Optional strategy: if filled side is very strong near close, hold instead of hedging.
+        # Optional strategy: in late window, buy favored side if very strong.
         if STRATEGY_MODE == "buy_hold_91":
-            filled_ask = get_best_ask_safe(ws_feed, client, filled_token)
-            if (
-                filled_ask is not None
-                and filled_ask >= BUY_HOLD_TRIGGER_PRICE
-                and time_remaining <= BUY_HOLD_TRIGGER_REMAINING_S
-            ):
-                log.info(
-                    "  BUY-HOLD signal: %s ask=%.3f >= %.2f with %ds left — holding",
-                    filled_label, filled_ask, BUY_HOLD_TRIGGER_PRICE, time_remaining
-                )
-                log_trade(
-                    "buy_hold_signal",
-                    market_ts=ts,
-                    strategy=STRATEGY_MODE,
-                    filled_side=filled_label,
-                    filled_ask=round(filled_ask, 4),
-                    trigger_price=BUY_HOLD_TRIGGER_PRICE,
-                    remaining_s=time_remaining,
-                )
-                info["hedge_done"] = True
-                info["buy_hold"] = True
+            if _maybe_buy_hold_scale(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining):
                 continue
 
         # Reconciliation: if both sides filled (e.g. hedge side filled after we entered trailing), we're done
