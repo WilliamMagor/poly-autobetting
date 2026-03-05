@@ -165,6 +165,8 @@ async def get_market_info(slug: str, window_s: int = 900) -> dict:
         raise ValueError(f"Empty markets list for {slug}")
 
     m = data[0]["markets"][0]
+    if "clobTokenIds" not in m:
+        raise ValueError(f"Market missing 'clobTokenIds' field for {slug}")
     tokens = json.loads(m["clobTokenIds"]) if isinstance(m["clobTokenIds"], str) else m["clobTokenIds"]
     if not isinstance(tokens, list) or len(tokens) < 2:
         raise ValueError(f"Invalid clobTokenIds for {slug}")
