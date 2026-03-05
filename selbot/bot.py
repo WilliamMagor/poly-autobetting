@@ -147,6 +147,12 @@ HEDGE_USE_REST_FALLBACK = _env("PLACE_15_REST_FALLBACK", "0").strip().lower() in
 HEDGE_LOOP_INTERVAL_S = int(_env("PLACE_15_HEDGE_LOOP_S", "5"))
 HEDGE_ENABLED = _env("PLACE_15_HEDGE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 HEDGE_RETRY_INTERVAL_S = int(_env("PLACE_15_HEDGE_RETRY_S", "10"))
+STRATEGY_MODE = _env("PLACE_15_STRATEGY", "dual_hedge").strip().lower()
+BUY_HOLD_TRIGGER_PRICE = float(_env("PLACE_15_BUY_HOLD_TRIGGER_PRICE", "0.91"))
+BUY_HOLD_TRIGGER_REMAINING_S = int(_env("PLACE_15_BUY_HOLD_TRIGGER_REMAINING_S", "180"))
+PROFIT_BOOST_TRIGGER_PRICE = float(_env("PLACE_15_PROFIT_BOOST_TRIGGER_PRICE", "0.90"))
+PROFIT_BOOST_REMAINING_S = int(_env("PLACE_15_PROFIT_BOOST_REMAINING_S", "120"))
+PROFIT_BOOST_SHARES = int(_env("PLACE_15_PROFIT_BOOST_SHARES", "10"))
 INTER_ASSET_STAGGER_S = float(_env("PLACE_15_INTER_ASSET_STAGGER_S", "2.0"))
 MARKET_SYMBOLS = tuple(
     s.strip().lower() for s in _env("PLACE_15_SYMBOLS", "btc,eth").split(",") if s.strip()
@@ -411,23 +417,21 @@ def init_redeemer():
 def place_order(client, token_id: str, side_label: str, shares: float, price: float,
                 market_end_ts: int | None = None):
     """Place a single limit buy order. Returns order ID or None.
-    market_end_ts: when the market closes (ts + WINDOW_S). Order expires at market end so
-    it stays valid when placing early (e.g. 300s before market begins)."""
+    Orders are posted as GTC (good-'til-cancelled)."""
     from py_clob_client.order_builder.constants import BUY
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    exp = market_end_ts if market_end_ts else int(time.time()) + WINDOW_S
     order_args = OrderArgs(
         token_id=token_id,
         price=price,
         size=round(shares, 1),
         side=BUY,
-        expiration=exp,
+        expiration=0,
     )
     for attempt in range(1, 4):
         try:
             signed = client.create_order(order_args)
-            result = client.post_order(signed, OrderType.GTD)
+            result = client.post_order(signed, OrderType.GTC)
             oid = result.get("orderID", result.get("id", ""))
             if oid:
                 log.info("  %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
@@ -449,7 +453,6 @@ def sell_at_bid(client, token_id: str, shares: float, side_label: str,
     from py_clob_client.order_builder.constants import SELL
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    exp = market_end_ts if market_end_ts else int(time.time()) + WINDOW_S
     for attempt in range(1, max_attempts + 1):
         try:
             book = client.get_order_book(token_id)
@@ -465,10 +468,10 @@ def sell_at_bid(client, token_id: str, shares: float, side_label: str,
                 price=best_bid,
                 size=round(shares, 1),
                 side=SELL,
-                expiration=exp,
+                expiration=0,
             )
             signed = client.create_order(order_args)
-            result = client.post_order(signed, OrderType.GTD)
+            result = client.post_order(signed, OrderType.GTC)
             oid = result.get("orderID", result.get("id", ""))
             if not oid:
                 log.warning("  %s SELL no order ID: %s", side_label, result)
@@ -509,18 +512,17 @@ def buy_hedge(client, token_id: str, shares: float, side_label: str, price: floa
     from py_clob_client.order_builder.constants import BUY
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    exp = market_end_ts if market_end_ts else int(time.time()) + WINDOW_S
     order_args = OrderArgs(
         token_id=token_id,
         price=round(price, 2),
         size=round(shares, 1),
         side=BUY,
-        expiration=exp,
+        expiration=0,
     )
     for attempt in range(1, 4):
         try:
             signed = client.create_order(order_args)
-            result = client.post_order(signed, OrderType.GTD)
+            result = client.post_order(signed, OrderType.GTC)
             oid = result.get("orderID", result.get("id", ""))
             if oid:
                 log.info("  HEDGE %s BUY %.0f @ %.2f  [%s]", side_label, shares, price, oid[:12])
@@ -544,8 +546,72 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
     """Time-windowed trailing-stop hedge for one-sided fills."""
     now = int(time.time())
 
+    def _maybe_late_profit_boost(
+        market_ts: int,
+        info: dict,
+        up_token: str,
+        dn_token: str,
+        up_bal: float,
+        dn_bal: float,
+        time_remaining: int,
+    ) -> None:
+        if info.get("late_boost_done"):
+            return
+        if time_remaining <= 0 or time_remaining > PROFIT_BOOST_REMAINING_S:
+            return
+
+        min_original = SHARES_PER_SIDE - 0.01
+        if up_bal < min_original or dn_bal < min_original:
+            return
+
+        up_ask = get_best_ask_safe(ws_feed, client, up_token)
+        dn_ask = get_best_ask_safe(ws_feed, client, dn_token)
+
+        candidates: list[tuple[str, str, float, float]] = []
+        if up_ask is not None and up_ask >= PROFIT_BOOST_TRIGGER_PRICE:
+            candidates.append(("UP", up_token, up_ask, up_bal))
+        if dn_ask is not None and dn_ask >= PROFIT_BOOST_TRIGGER_PRICE:
+            candidates.append(("DN", dn_token, dn_ask, dn_bal))
+        if not candidates:
+            return
+
+        side_label, token_id, side_ask, side_bal = max(candidates, key=lambda item: item[2])
+        target_bal = SHARES_PER_SIDE + PROFIT_BOOST_SHARES - 0.01
+        if side_bal >= target_bal:
+            info["late_boost_done"] = True
+            log.info("  PROFIT BOOST skipped: %s already at %.1f shares", side_label, side_bal)
+            return
+
+        log.info(
+            "  PROFIT BOOST BUY: %s ask=%.3f >= %.2f with %ds left — buying +%d shares",
+            side_label,
+            side_ask,
+            PROFIT_BOOST_TRIGGER_PRICE,
+            time_remaining,
+            PROFIT_BOOST_SHARES,
+        )
+        oid = buy_hedge(
+            client,
+            token_id,
+            float(PROFIT_BOOST_SHARES),
+            side_label,
+            side_ask,
+            market_ts + WINDOW_S,
+        )
+        log_trade(
+            "profit_boost_buy",
+            market_ts=market_ts,
+            side=side_label,
+            price=round(side_ask, 4),
+            shares=PROFIT_BOOST_SHARES,
+            order_id=oid,
+            trigger_price=PROFIT_BOOST_TRIGGER_PRICE,
+            remaining_s=time_remaining,
+        )
+        info["late_boost_done"] = True
+
     for ts, info in list(past_markets.items()):
-        if info.get("hedge_done") or info.get("redeemed") or info.get("closed") or info.get("bailed"):
+        if info.get("redeemed") or info.get("closed") or info.get("bailed"):
             continue
 
         up_token = info.get("up_token", "")
@@ -557,18 +623,27 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
         time_elapsed = now - placed_at
         time_remaining = WINDOW_S - time_elapsed
 
+        try:
+            up_bal = check_token_balance(client, up_token)
+            dn_bal = check_token_balance(client, dn_token)
+        except Exception:
+            continue
+
+        if info.get("hedge_done"):
+            _maybe_late_profit_boost(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining)
+            continue
+
         # Step 1: Detect one-sided fill
         if not info.get("hedge_side"):
-            try:
-                up_bal = check_token_balance(client, up_token)
-                dn_bal = check_token_balance(client, dn_token)
-            except Exception:
-                continue
-
             if up_bal > 0 and dn_bal == 0:
                 hedge_side, filled_bal, filled_side_label = "dn", up_bal, "UP"
             elif dn_bal > 0 and up_bal == 0:
                 hedge_side, filled_bal, filled_side_label = "up", dn_bal, "DN"
+            elif up_bal >= SHARES_PER_SIDE - 0.01 and dn_bal >= SHARES_PER_SIDE - 0.01:
+                log.info("  HEDGE reconciled: both sides filled (UP=%.1f, DN=%.1f) — done", up_bal, dn_bal)
+                info["hedge_done"] = True
+                _maybe_late_profit_boost(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining)
+                continue
             else:
                 continue
 
@@ -602,15 +677,36 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
         filled_token = dn_token if hedge_side == "up" else up_token
         filled_label = "UP" if hedge_side == "dn" else "DN"
 
+        # Optional strategy: if filled side is very strong near close, hold instead of hedging.
+        if STRATEGY_MODE == "buy_hold_91":
+            filled_ask = get_best_ask_safe(ws_feed, client, filled_token)
+            if (
+                filled_ask is not None
+                and filled_ask >= BUY_HOLD_TRIGGER_PRICE
+                and time_remaining <= BUY_HOLD_TRIGGER_REMAINING_S
+            ):
+                log.info(
+                    "  BUY-HOLD signal: %s ask=%.3f >= %.2f with %ds left — holding",
+                    filled_label, filled_ask, BUY_HOLD_TRIGGER_PRICE, time_remaining
+                )
+                log_trade(
+                    "buy_hold_signal",
+                    market_ts=ts,
+                    strategy=STRATEGY_MODE,
+                    filled_side=filled_label,
+                    filled_ask=round(filled_ask, 4),
+                    trigger_price=BUY_HOLD_TRIGGER_PRICE,
+                    remaining_s=time_remaining,
+                )
+                info["hedge_done"] = True
+                info["buy_hold"] = True
+                continue
+
         # Reconciliation: if both sides filled (e.g. hedge side filled after we entered trailing), we're done
-        try:
-            up_bal = check_token_balance(client, up_token)
-            dn_bal = check_token_balance(client, dn_token)
-        except Exception:
-            continue
         if up_bal > 0 and dn_bal > 0:
             log.info("  HEDGE reconciled: both sides filled (UP=%.1f, DN=%.1f) — done", up_bal, dn_bal)
             info["hedge_done"] = True
+            _maybe_late_profit_boost(ts, info, up_token, dn_token, up_bal, dn_bal, time_remaining)
             continue
         hedge_bal = up_bal if hedge_side == "up" else dn_bal
 
