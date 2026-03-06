@@ -30,7 +30,7 @@ This is the only file you need to read/edit for normal operation.
 | BAIL ENGINE | check_bail_out (EV-based bail schedule) |
 | ON-CHAIN | merge_market, redeem_market (Polygon txs) |
 | BALANCE | check_token_balance (delegated to selbot/prices.py) |
-| REDEEM LOOP | try_merge_all, try_redeem_all |
+| REDEEM LOOP | try_merge_all, try_redeem_all, merge_redeem_loop |
 | MAIN LOOP | run(), hedge_loop, market rotation |
 | ENTRY POINT | _main() with auto-restart + crash backoff |
 

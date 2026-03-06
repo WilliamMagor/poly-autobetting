@@ -112,14 +112,33 @@ Independent late-stage boost:
 - and either side ask >= `PLACE_15_PROFIT_BOOST_TRIGGER_PRICE` (default `0.90`)
 - buy extra `PLACE_15_PROFIT_BOOST_SHARES` (default `10`) on the stronger side
 
-## 4) Market Close, Merge, and Redeem
+## 4) Merge and Redeem
 
-After close:
+Merge (complete sets → USDC) works at any time, not just after close.
+Redeem (winning side → USDC) requires market resolution.
 
-- bot checks market closure status
-- merges complete sets when possible
-- redeems winning positions on-chain
-- marks market state as closed/redeemed
+A dedicated background loop (`merge_redeem_loop`) handles both operations
+with adaptive timing:
+
+- **Aggressive (every 5s):** when a market window ended within the last 2 minutes,
+  or when both sides filled during an active market
+- **Normal (every 15s):** older pending markets
+- **Idle (every 30s):** no pending operations
+
+Merge flow:
+
+- Detects complete sets (both UP + DN tokens held) using fresh balance checks
+- Merges immediately — even during the active market window — to free capital
+- If both sides had equal balance (ideal case), marks position as fully closed
+- Uses exponential backoff on failures (10s, 20s, 40s... up to 5 min)
+
+Redeem flow:
+
+- Starts checking 30 seconds after market window end (time-based heuristic)
+- Polls Gamma API for closure status
+- If both sides still have balance, defers to merge first
+- Redeems one-sided remainder (winning tokens only)
+- Uses exponential backoff on failures
 
 ---
 

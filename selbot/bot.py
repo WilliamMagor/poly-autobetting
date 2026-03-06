@@ -152,8 +152,8 @@ BUY_HOLD_TRIGGER_PRICE = float(_env("PLACE_15_BUY_HOLD_TRIGGER_PRICE", "0.91"))
 BUY_HOLD_TRIGGER_REMAINING_S = int(_env("PLACE_15_BUY_HOLD_TRIGGER_REMAINING_S", "180"))
 BUY_HOLD_TARGET_SHARES = int(_env("PLACE_15_BUY_HOLD_TARGET_SHARES", "110"))
 PROFIT_BOOST_TRIGGER_PRICE = float(_env("PLACE_15_PROFIT_BOOST_TRIGGER_PRICE", "0.90"))
-PROFIT_BOOST_REMAINING_S = int(_env("PLACE_15_PROFIT_BOOST_REMAINING_S", "120"))
-PROFIT_BOOST_SHARES = int(_env("PLACE_15_PROFIT_BOOST_SHARES", "10"))
+PROFIT_BOOST_REMAINING_S = int(_env("PLACE_15_PROFIT_BOOST_REMAINING_S", "60"))
+PROFIT_BOOST_SHARES = int(_env("PLACE_15_PROFIT_BOOST_SHARES", "100"))
 INTER_ASSET_STAGGER_S = float(_env("PLACE_15_INTER_ASSET_STAGGER_S", "2.0"))
 MARKET_SYMBOLS = tuple(
     s.strip().lower() for s in _env("PLACE_15_SYMBOLS", "btc,eth").split(",") if s.strip()
@@ -172,6 +172,9 @@ FRESH_START = _env("PLACE_15_FRESH_START", "0").strip().lower() in ("1", "true",
 MAX_OPEN_MARKETS = int(_env("PLACE_15_MAX_OPEN_MARKETS", "0"))
 NEXT_MARKET_PREFETCH_SEC = 120
 MERGE_REDEEM_INTERVAL_S = 30
+MERGE_AGGRESSIVE_WINDOW_S = 600
+MERGE_AGGRESSIVE_INTERVAL_S = 5
+MERGE_NORMAL_INTERVAL_S = 15
 
 _FEE_PARAMS = FeeParams.for_crypto()
 _FILL_DEDUP: FillDeduplicator | None = None
@@ -1281,12 +1284,17 @@ from selbot.prices import check_token_balance, BalanceCheckError, clear_cache as
 
 
 # ============================================================================
-# == REDEEM LOOP — try_merge_all, try_redeem_all
+# == REDEEM LOOP — try_merge_all, try_redeem_all, merge_redeem_loop
 # ============================================================================
 
 
 async def try_merge_all(client, redeemer, past_markets: dict):
-    """Merge complete sets (UP + DN) into USDC after market closes."""
+    """Merge complete sets (UP + DN) into USDC.
+
+    Merging doesn't require market resolution — it works any time both tokens
+    are held. This is the primary profit-capture path: buy both at 0.46,
+    merge for $1, pocket the difference immediately.
+    """
     if not redeemer:
         return
     merged = []
@@ -1299,19 +1307,17 @@ async def try_merge_all(client, redeemer, past_markets: dict):
         slug = info.get("slug", "")
         title = info.get("title", slug or str(ts))
 
-        if not info.get("closed"):
+        if not condition_id:
             if not slug:
                 continue
             try:
                 mkt = await get_market_info(slug)
             except Exception:
                 continue
-            if not mkt["closed"]:
-                continue
-            info["closed"] = True
-            if not condition_id:
-                condition_id = mkt["conditionId"]
-                info["condition_id"] = condition_id
+            condition_id = mkt["conditionId"]
+            info["condition_id"] = condition_id
+            if mkt["closed"]:
+                info["closed"] = True
             if not up_token:
                 up_token = mkt["up_token"]
                 info["up_token"] = up_token
@@ -1319,39 +1325,63 @@ async def try_merge_all(client, redeemer, past_markets: dict):
                 dn_token = mkt["dn_token"]
                 info["dn_token"] = dn_token
 
-        if not condition_id:
+        if not up_token or not dn_token:
             continue
 
         try:
-            up_bal = check_token_balance(client, up_token)
-            dn_bal = check_token_balance(client, dn_token)
+            up_bal = check_token_balance(client, up_token, skip_cache=True)
+            dn_bal = check_token_balance(client, dn_token, skip_cache=True)
         except Exception:
             continue
         merge_amount = min(up_bal, dn_bal)
         if merge_amount <= 0:
             continue
 
+        if not info.get("closed"):
+            now_ts = int(time.time())
+            market_end = ts + WINDOW_S
+            if now_ts < market_end:
+                if PROFIT_BOOST_SHARES > 0 and not info.get("late_boost_done"):
+                    continue
+
         merge_fails = info.get("merge_fails", 0)
-        if merge_fails >= 5:
-            continue
-        log.info("  Merging %s (%.1f complete sets)...", title[:50], merge_amount)
+        if merge_fails > 0:
+            backoff_s = min(300, 10 * (2 ** (merge_fails - 1)))
+            last_fail = info.get("merge_last_fail_ts", 0)
+            if time.time() - last_fail < backoff_s:
+                continue
+
+        is_closed = info.get("closed", False)
+        log.info("  Merging %s (%.1f sets, closed=%s)...", title[:50], merge_amount, is_closed)
         ok = await asyncio.to_thread(merge_market, redeemer, condition_id, merge_amount)
-        log_trade("merge", symbol=info.get("symbol"), market_ts=ts, title=title, sets=merge_amount, ok=ok)
+        log_trade("merge", symbol=info.get("symbol"), market_ts=ts, title=title,
+                  sets=merge_amount, ok=ok, market_closed=is_closed)
         if ok:
             merged.append(ts)
+            clear_balance_cache()
+            if abs(up_bal - dn_bal) < 0.01:
+                info["redeemed"] = True
+                log.info("  Fully merged — position closed for %s", title[:50])
         else:
             info["merge_fails"] = merge_fails + 1
-            if merge_fails + 1 >= 5:
-                log.warning("  Merge gave up on %s after 5 failures", title[:50])
+            info["merge_last_fail_ts"] = time.time()
+            if merge_fails + 1 >= 10:
+                log.warning("  Merge backoff maxed on %s (%d failures)", title[:50], merge_fails + 1)
 
     if merged:
         log.info("  Merged %d market(s)", len(merged))
 
 
 async def try_redeem_all(client, redeemer, past_markets: dict):
-    """Redeem resolved positions after market closes."""
+    """Redeem resolved positions after market closes.
+
+    Requires market resolution (closed=True). Used for one-sided positions
+    or remainders after partial merge. Uses time-based heuristic to start
+    checking for close 30s after window end.
+    """
     if not redeemer:
         return
+    now = int(time.time())
     redeemed = []
     for ts, info in list(past_markets.items()):
         if info.get("redeemed"):
@@ -1364,6 +1394,9 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
         title = info.get("title", slug or str(ts))
 
         if not info.get("closed"):
+            market_end = ts + WINDOW_S
+            if now < market_end + 30:
+                continue
             if not slug:
                 continue
             try:
@@ -1391,8 +1424,8 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
             continue
 
         try:
-            up_bal = check_token_balance(client, up_token)
-            dn_bal = check_token_balance(client, dn_token)
+            up_bal = check_token_balance(client, up_token, skip_cache=True)
+            dn_bal = check_token_balance(client, dn_token, skip_cache=True)
         except Exception:
             continue
 
@@ -1400,22 +1433,87 @@ async def try_redeem_all(client, redeemer, past_markets: dict):
             info["redeemed"] = True
             continue
 
-        redeem_fails = info.get("redeem_fails", 0)
-        if redeem_fails >= 5:
+        if up_bal > 0 and dn_bal > 0:
             continue
+
+        redeem_fails = info.get("redeem_fails", 0)
+        if redeem_fails > 0:
+            backoff_s = min(300, 10 * (2 ** (redeem_fails - 1)))
+            last_fail = info.get("redeem_last_fail_ts", 0)
+            if time.time() - last_fail < backoff_s:
+                continue
+
         log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", title[:50], up_bal, dn_bal)
         ok = await asyncio.to_thread(redeem_market, redeemer, condition_id, neg_risk, up_bal, dn_bal)
-        log_trade("redeem", symbol=info.get("symbol"), market_ts=ts, title=title, up_bal=up_bal, dn_bal=dn_bal, ok=ok)
+        log_trade("redeem", symbol=info.get("symbol"), market_ts=ts, title=title,
+                  up_bal=up_bal, dn_bal=dn_bal, ok=ok)
         if ok:
             info["redeemed"] = True
             redeemed.append(ts)
+            clear_balance_cache()
         else:
             info["redeem_fails"] = redeem_fails + 1
-            if redeem_fails + 1 >= 5:
-                log.warning("  Redeem gave up on %s after 5 failures", title[:50])
+            info["redeem_last_fail_ts"] = time.time()
+            if redeem_fails + 1 >= 10:
+                log.warning("  Redeem backoff maxed on %s (%d failures)", title[:50], redeem_fails + 1)
 
     if redeemed:
         log.info("  Redeemed %d market(s)", len(redeemed))
+
+
+async def merge_redeem_loop(client, redeemer, past_markets_by_symbol: dict, symbols: tuple):
+    """Dedicated background loop for merge and redeem with adaptive timing.
+
+    Runs independently of the main placement loop so capital is freed ASAP.
+    Uses three timing tiers:
+      - Aggressive (5s): markets whose window ended within last 2 minutes
+      - Normal (15s): older pending markets
+      - Idle (30s): no pending operations
+    """
+    while not _shutdown:
+        try:
+            now = int(time.time())
+            has_urgent = False
+            has_pending = False
+
+            for sym in symbols:
+                past = past_markets_by_symbol.get(sym, {})
+                for ts, info in past.items():
+                    if info.get("redeemed"):
+                        continue
+                    market_end = ts + WINDOW_S
+                    age_after_close = now - market_end
+                    if 0 < age_after_close <= MERGE_AGGRESSIVE_WINDOW_S:
+                        has_urgent = True
+                    elif age_after_close > 0:
+                        has_pending = True
+
+                    up_token = info.get("up_token", "")
+                    dn_token = info.get("dn_token", "")
+                    if up_token and dn_token and not info.get("closed"):
+                        try:
+                            up_bal = check_token_balance(client, up_token)
+                            dn_bal = check_token_balance(client, dn_token)
+                            if up_bal > 0 and dn_bal > 0 and info.get("hedge_done"):
+                                has_urgent = True
+                        except Exception:
+                            pass
+
+            for sym in symbols:
+                past = past_markets_by_symbol.get(sym, {})
+                if past:
+                    await try_merge_all(client, redeemer, past)
+                    await try_redeem_all(client, redeemer, past)
+
+            if has_urgent:
+                await asyncio.sleep(MERGE_AGGRESSIVE_INTERVAL_S)
+            elif has_pending:
+                await asyncio.sleep(MERGE_NORMAL_INTERVAL_S)
+            else:
+                await asyncio.sleep(MERGE_REDEEM_INTERVAL_S)
+        except Exception as e:
+            log.debug("merge_redeem_loop error: %s", e)
+            await asyncio.sleep(MERGE_REDEEM_INTERVAL_S)
 
 
 # ============================================================================
@@ -1471,7 +1569,7 @@ async def run():
 
     placed_markets: dict[str, set[int]] = {sym: set() for sym in symbols}
     past_markets_by_symbol: dict[str, dict[int, dict]] = {sym: {} for sym in symbols}
-    last_merge_redeem_ts = 0
+    last_merge_redeem_ts = 0  # kept for inline fallback when redeemer is None
 
     # Start hedge loop as background task (if enabled)
     if HEDGE_ENABLED:
@@ -1479,6 +1577,11 @@ async def run():
             asyncio.create_task(hedge_loop(client, ws_feed, past_markets_by_symbol[sym]))
     else:
         log.info("Hedging DISABLED (PLACE_15_HEDGE_ENABLED=0)")
+
+    if redeemer:
+        asyncio.create_task(merge_redeem_loop(client, redeemer, past_markets_by_symbol, symbols))
+        log.info("Merge/redeem background loop started (aggressive=%ds, normal=%ds).",
+                 MERGE_AGGRESSIVE_INTERVAL_S, MERGE_NORMAL_INTERVAL_S)
 
     # Scan recent markets (last 2 hours) for unredeemed positions
     now = int(time.time())
@@ -1803,13 +1906,9 @@ async def run():
             await check_bail_out(client, ws_feed, past_markets_by_symbol[sym])
 
         # ----------------------------------------------------------------
-        # 5. MERGE + REDEEM (throttled to every 30s)
+        # 5. MERGE + REDEEM — handled by merge_redeem_loop background task
+        #    (adaptive timing: 5s aggressive / 15s normal / 30s idle)
         # ----------------------------------------------------------------
-        if now - last_merge_redeem_ts >= MERGE_REDEEM_INTERVAL_S:
-            for sym in symbols:
-                await try_merge_all(client, redeemer, past_markets_by_symbol[sym])
-                await try_redeem_all(client, redeemer, past_markets_by_symbol[sym])
-            last_merge_redeem_ts = now
 
         # ----------------------------------------------------------------
         # 6. ADAPTIVE SLEEP + CLEANUP (15-min market — no need to poll aggressively)
