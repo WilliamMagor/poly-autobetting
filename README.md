@@ -1,16 +1,20 @@
 # poly-autobetting
 
-Automated trading bot for Polymarket BTC 15-minute prediction markets. Places configurable limit orders on both UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions on-chain.
+Automated trading bot for Polymarket 15-minute prediction markets (BTC/ETH by default). Places configurable limit orders on UP and DOWN outcomes, monitors positions with real-time WebSocket prices, and auto-redeems resolved positions on-chain.
 
 ## How It Works
 
-The bot targets BTC 15-minute up/down binary markets on Polymarket. It places limit buy orders on both sides (UP and DOWN) for each market at a configurable entry price (default 46c). When both sides fill, the combined cost is < $1.00 for a guaranteed $1.00 payout. It automatically rotates to new markets every 15 minutes.
+The bot targets 15-minute up/down binary markets on Polymarket for configured symbols (default: BTC and ETH). It places limit buy orders on both sides (UP and DOWN) for each market at a configurable entry price (default 46c). When both sides fill, the combined cost is < $1.00 for a guaranteed $1.00 payout. It automatically rotates to new markets every 15 minutes.
 
 - **Dual-Side Limit Orders** — places limit buys on both UP and DOWN at configurable entry price
 - **Auto-Rotation** — detects and places orders on upcoming 15-minute markets (900s window)
 - **WebSocket Price Feed** — real-time order book monitoring with auto-reconnect
 - **EV-Based Hedge/Bail** — time-phased trailing hedge and EV-based bail schedule
+- **Buy-Hold Option** — optional late-stage favored-side scaling in `buy_hold_91` mode
+- **Late Profit Boost** — optional extra buy when both sides are filled and one side is strong near close
 - **Auto-Redeem** — redeems resolved positions via direct on-chain Polygon transaction
+
+See `BOT_PROCESS.md` for a full process walkthrough, market slug format, and strategy details.
 
 ## Project Structure
 
@@ -39,7 +43,7 @@ logs/              # Trade logs (place_15_YYYYMMDD.jsonl)
 ### Installation
 
 ```bash
-git clone https://github.com/0xalexkxk/poly-autobetting.git
+git clone https://github.com/WilliamMagor/poly-autobetting.git
 cd poly-autobetting
 
 python -m venv venv
@@ -70,7 +74,7 @@ venv\Scripts\activate
 python selbot/bot.py
 ```
 
-The bot will place limit orders on both UP and DOWN for the current and upcoming BTC 15-minute markets, then loop to check for new markets, manage hedges/bails, and redeem resolved positions.
+The bot will place limit orders on both UP and DOWN for the current and upcoming configured 15-minute markets (default BTC/ETH), then loop to check for new markets, manage hedges/bails/late-stage strategy logic, and redeem resolved positions.
 
 ### Monitor Dashboard
 
