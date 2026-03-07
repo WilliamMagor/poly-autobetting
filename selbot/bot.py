@@ -154,6 +154,7 @@ BUY_HOLD_TARGET_SHARES = int(_env("PLACE_15_BUY_HOLD_TARGET_SHARES", "110"))
 PROFIT_BOOST_TRIGGER_PRICE = float(_env("PLACE_15_PROFIT_BOOST_TRIGGER_PRICE", "0.90"))
 PROFIT_BOOST_REMAINING_S = int(_env("PLACE_15_PROFIT_BOOST_REMAINING_S", "60"))
 PROFIT_BOOST_SHARES = int(_env("PLACE_15_PROFIT_BOOST_SHARES", "100"))
+PROFIT_BOOST_MIN_MOVE_PCT = float(_env("PLACE_15_PROFIT_BOOST_MIN_MOVE", "0.15"))
 INTER_ASSET_STAGGER_S = float(_env("PLACE_15_INTER_ASSET_STAGGER_S", "2.0"))
 MARKET_SYMBOLS = tuple(
     s.strip().lower() for s in _env("PLACE_15_SYMBOLS", "btc,eth").split(",") if s.strip()
@@ -204,6 +205,32 @@ def _validate_token_id(token_id: str, field_name: str) -> str:
     if not token_id.isdigit():
         raise ValueError(f"Invalid {field_name}: expected numeric string, got {token_id}")
     return token_id
+
+
+_crypto_price_cache: dict[str, tuple[float, float]] = {}
+_CRYPTO_PRICE_TTL = 5.0
+
+
+def get_crypto_price_sync(symbol: str) -> float | None:
+    """Fetch current crypto price from Binance (synchronous, 5s TTL cache)."""
+    now = time.time()
+    key = symbol.lower()
+    cached = _crypto_price_cache.get(key)
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        ticker = f"{symbol.upper()}USDT"
+        r = httpx.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": ticker},
+            timeout=5,
+        )
+        r.raise_for_status()
+        price = float(r.json()["price"])
+        _crypto_price_cache[key] = (price, now + _CRYPTO_PRICE_TTL)
+        return price
+    except Exception:
+        return cached[0] if cached else None
 
 
 # ============================================================================
@@ -658,14 +685,32 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
         if up_bal < min_original or dn_bal < min_original:
             return
 
+        move_side: str | None = None
+        start_price = info.get("start_price")
+        sym = info.get("symbol", "btc")
+        if start_price and PROFIT_BOOST_MIN_MOVE_PCT > 0:
+            current_price = get_crypto_price_sync(sym)
+            if current_price is None:
+                return
+            move_pct = (current_price - start_price) / start_price * 100
+            if abs(move_pct) < PROFIT_BOOST_MIN_MOVE_PCT:
+                log.info(
+                    "  PROFIT BOOST skip: %s moved only %.3f%% (need %.2f%%)",
+                    sym.upper(), move_pct, PROFIT_BOOST_MIN_MOVE_PCT,
+                )
+                return
+            move_side = "UP" if move_pct > 0 else "DN"
+
         up_ask = get_best_ask_safe(ws_feed, client, up_token)
         dn_ask = get_best_ask_safe(ws_feed, client, dn_token)
 
         candidates: list[tuple[str, str, float, float]] = []
         if up_ask is not None and up_ask >= PROFIT_BOOST_TRIGGER_PRICE:
-            candidates.append(("UP", up_token, up_ask, up_bal))
+            if move_side is None or move_side == "UP":
+                candidates.append(("UP", up_token, up_ask, up_bal))
         if dn_ask is not None and dn_ask >= PROFIT_BOOST_TRIGGER_PRICE:
-            candidates.append(("DN", dn_token, dn_ask, dn_bal))
+            if move_side is None or move_side == "DN":
+                candidates.append(("DN", dn_token, dn_ask, dn_bal))
         if not candidates:
             return
 
@@ -676,13 +721,20 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
             log.info("  PROFIT BOOST skipped: %s already at %.1f shares", side_label, side_bal)
             return
 
+        move_info = ""
+        if start_price and move_side:
+            current_price = get_crypto_price_sync(sym)
+            if current_price:
+                move_info = f" ({sym.upper()} ${start_price:,.0f}→${current_price:,.0f})"
+
         log.info(
-            "  PROFIT BOOST BUY: %s ask=%.3f >= %.2f with %ds left — buying +%d shares",
+            "  PROFIT BOOST BUY: %s ask=%.3f >= %.2f with %ds left — buying +%d shares%s",
             side_label,
             side_ask,
             PROFIT_BOOST_TRIGGER_PRICE,
             time_remaining,
             PROFIT_BOOST_SHARES,
+            move_info,
         )
         oid = buy_hedge(
             client,
@@ -701,6 +753,8 @@ async def check_hedge_trailing(client, ws_feed: WSBookFeed, past_markets: dict):
             order_id=oid,
             trigger_price=PROFIT_BOOST_TRIGGER_PRICE,
             remaining_s=time_remaining,
+            start_price=start_price,
+            move_side=move_side,
         )
         info["late_boost_done"] = True
 
@@ -1789,6 +1843,10 @@ async def run():
                 if sym_idx > 0 and INTER_ASSET_STAGGER_S > 0:
                     await asyncio.sleep(INTER_ASSET_STAGGER_S)
 
+                start_price = await asyncio.to_thread(get_crypto_price_sync, sym)
+                if start_price:
+                    log.info("  %s start price: $%,.2f", sym.upper(), start_price)
+
                 market_end = ts + WINDOW_S
                 up_id, dn_id = await asyncio.gather(
                     asyncio.to_thread(
@@ -1844,6 +1902,7 @@ async def run():
                     "neg_risk": mkt.get("neg_risk", False),
                     "title": mkt.get("title", slug),
                     "placed_at": ts,
+                    "start_price": start_price,
                     "position": PositionState(),
                 }
 
